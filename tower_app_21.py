@@ -20,9 +20,9 @@ from PyQt5.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QStatusBar,
     QSplitter, QMessageBox, QComboBox, QProgressDialog, QDialog, 
     QDialogButtonBox, QFileDialog, QCheckBox, QDateEdit, QMenuBar, QAction,
-    QActionGroup
+    QActionGroup, QRadioButton, QButtonGroup, QSpinBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QLocale, QDate
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QLocale, QDate, QSettings
 from PyQt5.QtGui import QFont, QDoubleValidator, QIntValidator, QIcon
 
 # Importaciones de Matplotlib para PyQt
@@ -366,45 +366,94 @@ class ControladorPID:
 # 4. PARSER LIGERO DE ARCHIVOS EPW
 # ==========================================
 def leer_archivo_epw(path_epw):
+    """Lee un archivo EPW de forma robusta.
+
+    Busca filas de datos detectando si la primera cuatro columnas son año/mes/día/hora
+    y acepta diferentes longitudes de encabezado. Devuelve una lista de diccionarios
+    con las claves: 'dt','tdb','twb','rh','patm','u_viento'.
+    """
     datos_clima = []
+
+    def _safe_int(s):
+        try:
+            return int(str(s).strip())
+        except Exception:
+            return None
+
+    def _safe_float(s, default=None):
+        try:
+            return float(str(s).strip().replace(',', '.'))
+        except Exception:
+            return default
+
     with open(path_epw, 'r', encoding='utf-8', errors='ignore') as f:
         reader = csv.reader(f)
-        header_count = 0
         for row in reader:
-            if header_count < 8:
-                header_count += 1
+            if not row or len(row) < 4:
                 continue
-            if len(row) > 21:
-                try:
-                    anio = int(row[0])
-                    mes = int(row[1])
-                    dia = int(row[2])
-                    hora = int(row[3]) - 1
-                    
-                    dt = datetime(2024, mes, dia, hora)
-                    tdb = float(row[6])
-                    tdew = float(row[7])
-                    rh = float(row[8]) / 100.0
-                    p_atm = float(row[9])
-                    
-                    # Intentar leer velocidad del viento (columna 21) si existe
-                    try:
-                        u_viento = float(row[21])
-                    except (IndexError, ValueError):
-                        u_viento = 3.5  # m/s por defecto
-                    
-                    twb = tdb * np.arctan(0.151977 * (rh * 100.0 + 8.313659)**0.5) + np.arctan(tdb + rh * 100.0) - np.arctan(rh * 100.0 - 1.676331) + 0.00391838 * (rh * 100.0)**1.5 * np.arctan(0.023101 * rh * 100.0) - 4.686035
-                    
-                    datos_clima.append({
-                        'dt': dt,
-                        'tdb': tdb,
-                        'twb': twb,
-                        'rh': rh,
-                        'patm': p_atm,
-                        'u_viento': u_viento
-                    })
-                except (ValueError, IndexError):
-                    continue
+
+            # limpiar posibles caracteres BOM y espacios
+            try:
+                row0 = row[0].lstrip('\ufeff').strip()
+            except Exception:
+                row0 = str(row[0]).strip()
+
+            anio = _safe_int(row0)
+            mes = _safe_int(row[1])
+            dia = _safe_int(row[2])
+            hora = _safe_int(row[3])
+
+            # aceptar únicamente filas que parezcan datos (rangos plausibles)
+            if anio is None or mes is None or dia is None or hora is None:
+                continue
+            if not (1900 <= anio <= 2100 and 1 <= mes <= 12 and 1 <= dia <= 31 and 1 <= hora <= 24):
+                continue
+
+            # convertir hora EPW (1..24) a 0..23
+            hora_idx = max(0, min(23, hora - 1))
+
+            try:
+                dt = datetime(anio, mes, dia, hora_idx)
+            except Exception:
+                continue
+
+            # columnas típicas de EPW (si faltan, se usan valores por defecto razonables)
+            tdb = _safe_float(row[6], None) if len(row) > 6 else None
+            # intentar columna de punto de rocío/humedad si está disponible
+            tdew = _safe_float(row[7], None) if len(row) > 7 else None
+            rh_raw = _safe_float(row[8], None) if len(row) > 8 else None
+            patm = _safe_float(row[9], None) if len(row) > 9 else None
+
+            if tdb is None or rh_raw is None:
+                # si faltan datos críticos, saltar la fila
+                continue
+
+            # RH en EPW viene en % (0..100)
+            rh = rh_raw / 100.0 if rh_raw is not None else 0.0
+
+            u_viento = _safe_float(row[21], None) if len(row) > 21 else None
+            if u_viento is None:
+                # intentar columnas alternativas comunes (ej. 20)
+                if len(row) > 20:
+                    u_viento = _safe_float(row[20], 3.5)
+                else:
+                    u_viento = 3.5
+
+            # aproximación rápida de Twb si no hay columna directa
+            try:
+                twb = float(tdb) * np.arctan(0.151977 * (rh * 100.0 + 8.313659) ** 0.5) + np.arctan(float(tdb) + rh * 100.0) - np.arctan(rh * 100.0 - 1.676331) + 0.00391838 * (rh * 100.0) ** 1.5 * np.arctan(0.023101 * rh * 100.0) - 4.686035
+            except Exception:
+                twb = float(tdb)
+
+            datos_clima.append({
+                'dt': dt,
+                'tdb': float(tdb),
+                'twb': float(twb),
+                'rh': float(rh),
+                'patm': float(patm) if patm is not None else 101325.0,
+                'u_viento': float(u_viento)
+            })
+
     return datos_clima
 
 # ==========================================
@@ -496,6 +545,33 @@ class SimularDinamicaWorker(QThread):
             clima = leer_archivo_epw(self.cfg['path_epw'])
             if not clima:
                 raise ValueError("No se pudieron extraer datos válidos del archivo EPW.")
+
+            # Si la configuración solicita normalizar a un único año, aplicar aquí
+            if self.cfg.get('epw_normalize'):
+                target_year = int(self.cfg.get('epw_normalize_year') or 2000)
+                clima_norm = []
+                for r in clima:
+                    dt0 = r['dt']
+                    m = dt0.month
+                    d = dt0.day
+                    h = dt0.hour
+                    try:
+                        ndt = datetime(target_year, m, d, h)
+                    except ValueError:
+                        # fallback: try common valid day choices (handle Feb 29)
+                        ndt = None
+                        for dd in (28, 27, 26, 25):
+                            try:
+                                ndt = datetime(target_year, m, dd, h)
+                                break
+                            except Exception:
+                                ndt = None
+                        if ndt is None:
+                            ndt = datetime(target_year, m, max(1, min(28, d)), h)
+                    nr = dict(r)
+                    nr['dt'] = ndt
+                    clima_norm.append(nr)
+                clima = clima_norm
 
             f_ini = self.cfg['fecha_inicio']
             f_fin = self.cfg['fecha_fin']
@@ -1047,6 +1123,72 @@ class DialogoPerfilPluma(QDialog):
 # ==========================================
 # 7. VENTANA EMERGENTE DE SIMULACIÓN DINÁMICA
 # ==========================================
+class DialogoEpwChoice(QDialog):
+    def __init__(self, parent=None, years=None, idioma='es'):
+        super().__init__(parent)
+        self.idioma = idioma
+        self.setWindowTitle(self.tr_txt('epw_multi_title'))
+        self.setModal(True)
+        self.years = sorted(years) if years else []
+        self.choice = {'action': 'preserve', 'year': None}
+        self._init_ui()
+
+    def tr_txt(self, key, **kwargs):
+        return traducir(self.idioma, key, **kwargs)
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        lbl = QLabel(self.tr_txt('epw_multi_info'))
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        self.rb_preserve = QRadioButton(self.tr_txt('epw_multi_preserve'))
+        self.rb_normalize = QRadioButton(self.tr_txt('epw_multi_normalize'))
+        self.rb_preserve.setChecked(True)
+
+        layout.addWidget(self.rb_preserve)
+        h = QHBoxLayout()
+        h.addWidget(self.rb_normalize)
+        self.spin_year = QSpinBox()
+        self.spin_year.setRange(1900, 2100)
+        self.spin_year.setValue(2000)
+        h.addWidget(self.spin_year)
+        h.addStretch()
+        layout.addLayout(h)
+
+        if self.years:
+            years_text = ', '.join(str(y) for y in self.years[:10])
+            info = QLabel(self.tr_txt('epw_multi_years_present').format(years=years_text))
+            info.setStyleSheet('color: #555555; font-size: 11px;')
+            layout.addWidget(info)
+
+        # Remember choice checkbox
+        self.chk_remember = QCheckBox(self.tr_txt('epw_multi_remember'))
+        layout.addWidget(self.chk_remember)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        if self.rb_normalize.isChecked():
+            self.choice = {'action': 'normalize', 'year': int(self.spin_year.value())}
+        else:
+            self.choice = {'action': 'preserve', 'year': None}
+        # persist if requested
+        try:
+            if self.chk_remember.isChecked():
+                settings = QSettings('cooling_towers', 'tower_app')
+                settings.setValue('epw_choice_action', self.choice['action'])
+                settings.setValue('epw_choice_year', self.choice['year'] if self.choice['year'] is not None else '')
+        except Exception:
+            pass
+        super().accept()
+
+    def get_choice(self):
+        return self.choice
+
 class VentanaSimulacionDinamica(QDialog):
     def __init__(self, parent=None, datos_torre=None, idioma='es', estado_previo=None):
         super().__init__(parent)
@@ -1054,8 +1196,8 @@ class VentanaSimulacionDinamica(QDialog):
         self.setWindowTitle(self.tr_txt('sim_title'))
         
         self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint | Qt.WindowMaximizeButtonHint)
-        self.resize(1340, 820)
-        self.setMinimumSize(980, 640)
+        self.resize(1340, 900)
+        self.setMinimumSize(980, 720)
         
         self.datos_torre = datos_torre
         self.res_sim = None
@@ -1083,9 +1225,9 @@ class VentanaSimulacionDinamica(QDialog):
 
         self.txt_epw_path = QLineEdit()
         self.txt_epw_path.setPlaceholderText(self.tr_txt('sim_epw_placeholder'))
-        self.txt_epw_path.setFont(QFont("Segoe UI", 8))
+        self.txt_epw_path.setFont(QFont("Segoe UI", 9))
         btn_epw = QPushButton(self.tr_txt('sim_btn_examinar'))
-        btn_epw.setFont(QFont("Segoe UI", 8))
+        btn_epw.setFont(QFont("Segoe UI", 9))
         btn_epw.clicked.connect(self.examinar_epw)
 
         grid_epw.addWidget(self.txt_epw_path, 0, 0)
@@ -1095,11 +1237,15 @@ class VentanaSimulacionDinamica(QDialog):
         gb_tiempo = QGroupBox(self.tr_txt('sim_gb_tiempo'))
         gb_tiempo.setStyleSheet(estilo_gb)
         grid_tiempo = QGridLayout(gb_tiempo)
+        grid_tiempo.setColumnMinimumWidth(0, 155)
+        grid_tiempo.setColumnMinimumWidth(1, 95)
 
         self.date_ini = QDateEdit(QDate(2024, 1, 1))
         self.date_ini.setDisplayFormat("dd/MM/yyyy")
+        self.date_ini.setFont(QFont("Segoe UI", 9))
         self.date_fin = QDateEdit(QDate(2024, 1, 7))
         self.date_fin.setDisplayFormat("dd/MM/yyyy")
+        self.date_fin.setFont(QFont("Segoe UI", 9))
 
         self.txt_dt_sim = QLineEdit("300.0")
         self.txt_vol_estanque = QLineEdit("15.0")
@@ -1109,6 +1255,7 @@ class VentanaSimulacionDinamica(QDialog):
         for txt in [self.txt_dt_sim, self.txt_vol_estanque, self.txt_coc, self.txt_drift]:
             txt.setFont(QFont("Segoe UI", 9))
             txt.setValidator(QDoubleValidator())
+            txt.setFixedWidth(90)
 
         conectar_formato_precision(self.txt_dt_sim, 1)
         conectar_formato_precision(self.txt_vol_estanque, 1)
@@ -1131,11 +1278,18 @@ class VentanaSimulacionDinamica(QDialog):
         grid_tiempo.addWidget(self.txt_drift, 5, 1)
         grid_tiempo.addWidget(QLabel("%"), 5, 2)
 
+        for i in range(grid_tiempo.count()):
+            w = grid_tiempo.itemAt(i).widget()
+            if isinstance(w, QLabel):
+                w.setFont(QFont("Segoe UI", 9))
+
         layout_cfg.addWidget(gb_tiempo)
 
         gb_pid = QGroupBox(self.tr_txt('sim_gb_pid'))
         gb_pid.setStyleSheet(estilo_gb)
         grid_pid = QGridLayout(gb_pid)
+        grid_pid.setColumnMinimumWidth(0, 155)
+        grid_pid.setColumnMinimumWidth(1, 95)
 
         self.txt_t_set = QLineEdit("20.6")
         self.txt_kp = QLineEdit("4.0")
@@ -1146,6 +1300,7 @@ class VentanaSimulacionDinamica(QDialog):
         for txt in [self.txt_t_set, self.txt_kp, self.txt_ti, self.txt_td, self.txt_speed_min]:
             txt.setFont(QFont("Segoe UI", 9))
             txt.setValidator(QDoubleValidator())
+            txt.setFixedWidth(90)
 
         for txt in [self.txt_t_set, self.txt_kp, self.txt_ti, self.txt_td, self.txt_speed_min]:
             conectar_formato_precision(txt, 1)
@@ -1169,19 +1324,28 @@ class VentanaSimulacionDinamica(QDialog):
         grid_pid.addWidget(self.txt_speed_min, 4, 1)
         grid_pid.addWidget(QLabel("%"), 4, 2)
 
+        for i in range(grid_pid.count()):
+            w = grid_pid.itemAt(i).widget()
+            if isinstance(w, QLabel):
+                w.setFont(QFont("Segoe UI", 9))
+
         layout_cfg.addWidget(gb_pid)
 
         gb_motor = QGroupBox(self.tr_txt('sim_gb_motor'))
         gb_motor.setStyleSheet(estilo_gb)
         grid_motor = QGridLayout(gb_motor)
+        grid_motor.setColumnMinimumWidth(0, 155)
+        grid_motor.setColumnMinimumWidth(1, 95)
 
         self.txt_p_motor = QLineEdit("150.0")
         self.txt_p_motor.setFont(QFont("Segoe UI", 9))
         self.txt_p_motor.setValidator(QDoubleValidator())
+        self.txt_p_motor.setFixedWidth(90)
         conectar_formato_precision(self.txt_p_motor, 1)
         self.txt_eta_fan = QLineEdit("75.0")
         self.txt_eta_fan.setFont(QFont("Segoe UI", 9))
         self.txt_eta_fan.setValidator(QDoubleValidator())
+        self.txt_eta_fan.setFixedWidth(90)
         conectar_formato_precision(self.txt_eta_fan, 1)
 
         grid_motor.addWidget(QLabel(self.tr_txt('sim_lbl_p_motor')), 0, 0)
@@ -1192,13 +1356,31 @@ class VentanaSimulacionDinamica(QDialog):
         grid_motor.addWidget(self.txt_eta_fan, 1, 1)
         grid_motor.addWidget(QLabel("%"), 1, 2)
 
+        for i in range(grid_motor.count()):
+            w = grid_motor.itemAt(i).widget()
+            if isinstance(w, QLabel):
+                w.setFont(QFont("Segoe UI", 9))
+
         layout_cfg.addWidget(gb_motor)
 
         self.btn_ejecutar = QPushButton(self.tr_txt('sim_btn_ejecutar'))
         self.btn_ejecutar.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        self.btn_ejecutar.setStyleSheet("background-color: #27AE60; color: white; padding: 8px; border-radius: 3px;")
+        self.btn_ejecutar.setMinimumHeight(32)
+        self.btn_ejecutar.setCursor(Qt.PointingHandCursor)
+        self.btn_ejecutar.setStyleSheet("QPushButton { background-color: #27AE60; color: white; padding: 8px; border-radius: 3px; } QPushButton:hover { background-color: #219653; }")
         self.btn_ejecutar.clicked.connect(self.ejecutar_simulacion)
-        layout_cfg.addWidget(self.btn_ejecutar)
+
+        self.btn_csv = QPushButton(self.tr_txt('sim_btn_csv'))
+        self.btn_csv.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        self.btn_csv.setMinimumHeight(32)
+        self.btn_csv.setCursor(Qt.PointingHandCursor)
+        self.btn_csv.setStyleSheet("QPushButton { background-color: #2980B9; color: white; padding: 8px; border-radius: 3px; } QPushButton:hover { background-color: #21618C; }")
+        self.btn_csv.clicked.connect(self.exportar_csv)
+
+        layout_botones_sim = QHBoxLayout()
+        layout_botones_sim.addWidget(self.btn_ejecutar)
+        layout_botones_sim.addWidget(self.btn_csv)
+        layout_cfg.addLayout(layout_botones_sim)
 
         gb_kpi = QGroupBox(self.tr_txt('sim_gb_kpi'))
         gb_kpi.setStyleSheet(estilo_gb)
@@ -1278,12 +1460,87 @@ class VentanaSimulacionDinamica(QDialog):
         main_layout.addWidget(panel_grafica, stretch=7)
         main_layout.addWidget(panel_derecho, stretch=2)
 
+    # Dialog to allow user choice when EPW contains multiple source years
+    def _prompt_epw_year_choice(self, years):
+        # Check saved preference first
+        try:
+            settings = QSettings('cooling_towers', 'tower_app')
+            saved_action = settings.value('epw_choice_action', '')
+            saved_year = settings.value('epw_choice_year', '')
+            if saved_action in ('preserve', 'normalize'):
+                year_val = int(saved_year) if saved_year not in (None, '', 'None') else None
+                return {'action': saved_action, 'year': year_val}
+        except Exception:
+            pass
+
+        dlg = DialogoEpwChoice(self, years, idioma=self.idioma)
+        res = dlg.exec_()
+        if res == QDialog.Accepted:
+            return dlg.get_choice()
+        return {'action': 'preserve', 'year': None}
+
     def examinar_epw(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, self.tr_txt('sim_dlg_examinar_title'), "", self.tr_txt('sim_dlg_examinar_filter')
         )
         if file_path:
             self.txt_epw_path.setText(file_path)
+            try:
+                clima = leer_archivo_epw(file_path)
+                if clima:
+                    years = sorted(set(c['dt'].year for c in clima))
+                    # si hay múltiples años, preguntar al usuario cómo tratarlos
+                    if len(years) > 1:
+                        choice = self._prompt_epw_year_choice(years)
+                    else:
+                        choice = {'action': 'preserve', 'year': None}
+
+                    # aplicar normalización solo para la vista previa (y recordar decisión para la simulación)
+                    self.epw_normalize = (choice['action'] == 'normalize')
+                    self.epw_normalize_year = int(choice['year']) if choice.get('year') else None
+
+                    if self.epw_normalize and self.epw_normalize_year:
+                        # crear copia normalizada de las entradas para la vista
+                        clima_preview = []
+                        for r in clima:
+                            dt0 = r['dt']
+                            y = self.epw_normalize_year
+                            m = dt0.month
+                            d = dt0.day
+                            h = dt0.hour
+                            # ajustar días inválidos (e.g., Feb 29)
+                            valid_dt = None
+                            try:
+                                valid_dt = datetime(y, m, d, h)
+                            except ValueError:
+                                # intentar retroceder hasta fecha válida
+                                for dd in (28, 27, 26, 25):
+                                    try:
+                                        valid_dt = datetime(y, m, dd, h)
+                                        break
+                                    except Exception:
+                                        valid_dt = None
+                            if valid_dt is None:
+                                valid_dt = datetime(y, m, max(1, min(28, d)), h)
+                            nr = dict(r)
+                            nr['dt'] = valid_dt
+                            clima_preview.append(nr)
+                        clima_use = clima_preview
+                    else:
+                        clima_use = clima
+
+                    dt_min = min(c['dt'] for c in clima_use)
+                    dt_max = max(c['dt'] for c in clima_use)
+                    # usar la fecha mínima encontrada como inicio
+                    q_ini = QDate(dt_min.year, dt_min.month, dt_min.day)
+                    # por defecto mostrar una ventana de 7 días o hasta la fecha máxima disponible
+                    dt_fin_def = dt_min + timedelta(days=6)
+                    dt_fin_use = dt_fin_def if dt_fin_def <= dt_max else dt_max
+                    q_fin = QDate(dt_fin_use.year, dt_fin_use.month, dt_fin_use.day)
+                    self.date_ini.setDate(q_ini)
+                    self.date_fin.setDate(q_fin)
+            except Exception:
+                pass
 
     def ejecutar_simulacion(self):
         path_epw = self.txt_epw_path.text()
@@ -1297,8 +1554,8 @@ class VentanaSimulacionDinamica(QDialog):
 
             cfg = {
                 'path_epw': path_epw,
-                'fecha_inicio': datetime(2024, d_ini.month(), d_ini.day(), 0, 0),
-                'fecha_fin': datetime(2024, d_fin.month(), d_fin.day(), 23, 59),
+                'fecha_inicio': datetime(d_ini.year(), d_ini.month(), d_ini.day(), 0, 0),
+                'fecha_fin': datetime(d_fin.year(), d_fin.month(), d_fin.day(), 23, 59),
                 'dt_sim_sec': float(self.txt_dt_sim.text()),
                 'vol_estanque_m3': float(self.txt_vol_estanque.text()),
                 'coc': float(self.txt_coc.text()),
@@ -1316,6 +1573,9 @@ class VentanaSimulacionDinamica(QDialog):
                 't_w_in_nom': self.datos_torre['T_w_in'],
                 'ntu_ref': self.datos_torre['NTU']
             }
+            # incluir la preferencia de normalización EPW si fue seleccionada
+            cfg['epw_normalize'] = getattr(self, 'epw_normalize', False)
+            cfg['epw_normalize_year'] = getattr(self, 'epw_normalize_year', None)
 
             self.progress = QProgressDialog(self.tr_txt('sim_iniciando'), "Cancelar", 0, 100, self)
             self.progress.setWindowTitle(self.tr_txt('title_sim_pid'))
@@ -1423,6 +1683,50 @@ class VentanaSimulacionDinamica(QDialog):
             self.res_sim = estado['res_sim']
             self.actualizar_labels_kpi(self.res_sim)
             self.replot()
+
+    def exportar_csv(self):
+        if self.res_sim is None:
+            QMessageBox.warning(self, self.tr_txt('title_sin_datos'), self.tr_txt('msg_sin_datos_csv'))
+            return
+
+        variables = [
+            (self.chk_tin, 't_in', 'chk_tin'),
+            (self.chk_tout, 't_out', 'chk_tout'),
+            (self.chk_twb, 't_wb', 'chk_twb'),
+            (self.chk_tdb, 't_db', 'chk_tdb'),
+            (self.chk_taout, 't_a_out', 'chk_taout'),
+            (self.chk_speed, 'fan_speed', 'chk_speed'),
+            (self.chk_power, 'power_kw', 'chk_power'),
+            (self.chk_q, 'q_mwt', 'chk_q'),
+            (self.chk_evap, 'evap', 'chk_evap'),
+            (self.chk_niebla, 'niebla', 'chk_niebla'),
+        ]
+        claves_datos = [data_key for chk, data_key, label_key in variables if chk.isChecked() and data_key in self.res_sim]
+        encabezados = [self.tr_txt('csv_col_fecha')] + [self.tr_txt(label_key) for chk, data_key, label_key in variables if chk.isChecked() and data_key in self.res_sim]
+
+        if not claves_datos:
+            QMessageBox.warning(self, self.tr_txt('title_sin_datos'), self.tr_txt('msg_sin_variables_csv'))
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, self.tr_txt('sim_csv_dialog_title'), "", self.tr_txt('sim_csv_filter'))
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.csv'):
+            file_path += '.csv'
+
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(encabezados)
+                times = self.res_sim['times']
+                for i in range(len(times)):
+                    fila = [times[i].strftime('%d/%m/%Y %H:%M:%S')]
+                    for key in claves_datos:
+                        fila.append(self.res_sim[key][i])
+                    writer.writerow(fila)
+            QMessageBox.information(self, self.tr_txt('title_csv_exportado'), self.tr_txt('msg_csv_exportado', path=file_path))
+        except Exception as e:
+            QMessageBox.critical(self, self.tr_txt('title_error_csv'), self.tr_txt('msg_error_csv', err=e))
 
     def procesar_cancelado(self):
         if hasattr(self, 'progress') and self.progress:
@@ -1729,7 +2033,7 @@ TRANSLATIONS = {
         'sim_gb_motor': "4. Motor y Eficiencia",
         'sim_lbl_p_motor': "Potencia Motor:",
         'sim_lbl_eta_fan': "Eficiencia Global:",
-        'sim_btn_ejecutar': "Ejecutar Simulación Dinámica",
+        'sim_btn_ejecutar': "Simular",
         'sim_gb_kpi': "📊 Balance de Agua y KPIs del Período",
         'sim_kpi_q_disipada': "Energía Disipada:",
         'sim_kpi_kwh_total': "Energía Consumida:",
@@ -1752,6 +2056,22 @@ TRANSLATIONS = {
         'chk_evap': "Evaporación (m³/h)",
         'sim_dlg_examinar_title': "Seleccionar archivo climático EPW",
         'sim_dlg_examinar_filter': "Archivos EPW (*.epw);;Todos los archivos (*.*)",
+        'epw_multi_title': "EPW: Archivo con Múltiples Años Detectado",
+        'epw_multi_info': "El archivo EPW contiene filas originadas en varios años. ¿Cómo desea tratarlas?",
+        'epw_multi_preserve': "Preservar años originales (mantener datetimes tal cual)",
+        'epw_multi_normalize': "Normalizar a un solo año:",
+        'epw_multi_years_present': "Años presentes en el archivo: {years}",
+        'epw_multi_remember': "Recordar mi elección",
+        'epw_choice_cleared_title': "Preferencia EPW borrada",
+        'epw_choice_cleared_msg': "La preferencia guardada para archivos EPW ha sido eliminada.",
+        'epw_choice_cleared_err': "No se pudo eliminar la preferencia guardada.",
+        'sim_clear_epw_choice': "Borrar preferencia EPW guardada",
+        'menu_settings': "Configuración",
+        'sim_reset_prefs': "Restablecer todas las preferencias",
+        'reset_prefs_confirm_title': "Restablecer Preferencias",
+        'reset_prefs_confirm_msg': "¿Desea restablecer todas las preferencias de la aplicación a sus valores por defecto?",
+        'reset_prefs_done_msg': "Preferencias restablecidas correctamente.",
+        'reset_prefs_err_msg': "No se pudieron restablecer las preferencias.",
         'title_archivo_faltante': "Archivo Faltante",
         'msg_archivo_faltante': "Por favor seleccione un archivo .epw válido.",
         'title_sim_pid': "Simulación Dinámica PID",
@@ -1759,6 +2079,19 @@ TRANSLATIONS = {
         'msg_entrada_invalida_sim': "Por favor revise los parámetros numéricos ingresados.",
         'title_error_sim': "Error de Simulación",
         'msg_error_sim': "Ocurrió un error:\n{err}",
+
+        # --- Exportación CSV ---
+        'sim_btn_csv': "💾 Exportar",
+        'sim_csv_dialog_title': "Guardar Resultados como CSV",
+        'sim_csv_filter': "Archivos CSV (*.csv)",
+        'title_sin_datos': "Sin Datos",
+        'msg_sin_datos_csv': "Debe ejecutar una simulación antes de exportar resultados.",
+        'msg_sin_variables_csv': "Seleccione al menos una variable para exportar.",
+        'title_csv_exportado': "Exportación Exitosa",
+        'msg_csv_exportado': "Resultados exportados exitosamente a:\n{path}",
+        'title_error_csv': "Error de Exportación",
+        'msg_error_csv': "No se pudo exportar el archivo:\n{err}",
+        'csv_col_fecha': "Fecha/Hora",
 
         # --- Gráficos dinámicos (replot) ---
         'plot_niebla_activa': "Pluma/Niebla Activa",
@@ -1894,7 +2227,7 @@ TRANSLATIONS = {
         'sim_gb_motor': "4. Motor and Efficiency",
         'sim_lbl_p_motor': "Motor Power:",
         'sim_lbl_eta_fan': "Overall Efficiency:",
-        'sim_btn_ejecutar': "Run Dynamic Simulation",
+        'sim_btn_ejecutar': "Simulate",
         'sim_gb_kpi': "📊 Water Balance and Period KPIs",
         'sim_kpi_q_disipada': "Dissipated Energy:",
         'sim_kpi_kwh_total': "Consumed Energy:",
@@ -1917,6 +2250,22 @@ TRANSLATIONS = {
         'chk_evap': "Evaporation (m³/h)",
         'sim_dlg_examinar_title': "Select EPW Climate File",
         'sim_dlg_examinar_filter': "EPW Files (*.epw);;All Files (*.*)",
+        'epw_multi_title': "EPW: Multiple Years Detected",
+        'epw_multi_info': "The EPW file contains rows from multiple source years. How would you like to treat the dates?",
+        'epw_multi_preserve': "Preserve original years (keep datetimes as-is)",
+        'epw_multi_normalize': "Normalize to a single year:",
+        'epw_multi_years_present': "Years present in file: {years}",
+        'epw_multi_remember': "Remember my choice",
+        'epw_choice_cleared_title': "EPW Preference Cleared",
+        'epw_choice_cleared_msg': "Saved preference for EPW files has been removed.",
+        'epw_choice_cleared_err': "Could not remove saved EPW preference.",
+        'sim_clear_epw_choice': "Clear saved EPW preference",
+        'menu_settings': "Settings",
+        'sim_reset_prefs': "Reset all preferences",
+        'reset_prefs_confirm_title': "Reset Preferences",
+        'reset_prefs_confirm_msg': "Reset all application preferences to their defaults?",
+        'reset_prefs_done_msg': "Preferences reset successfully.",
+        'reset_prefs_err_msg': "Could not reset preferences.",
         'title_archivo_faltante': "Missing File",
         'msg_archivo_faltante': "Please select a valid .epw file.",
         'title_sim_pid': "Dynamic PID Simulation",
@@ -1924,6 +2273,19 @@ TRANSLATIONS = {
         'msg_entrada_invalida_sim': "Please check the entered numeric parameters.",
         'title_error_sim': "Simulation Error",
         'msg_error_sim': "An error occurred:\n{err}",
+
+        # --- CSV Export ---
+        'sim_btn_csv': "💾 Export",
+        'sim_csv_dialog_title': "Save Results as CSV",
+        'sim_csv_filter': "CSV Files (*.csv)",
+        'title_sin_datos': "No Data",
+        'msg_sin_datos_csv': "You must run a simulation before exporting results.",
+        'msg_sin_variables_csv': "Select at least one variable to export.",
+        'title_csv_exportado': "Export Successful",
+        'msg_csv_exportado': "Results successfully exported to:\n{path}",
+        'title_error_csv': "Export Error",
+        'msg_error_csv': "Could not export the file:\n{err}",
+        'csv_col_fecha': "Date/Time",
 
         # --- Dynamic Charts (replot) ---
         'plot_niebla_activa': "Active Plume/Fog",
@@ -1999,6 +2361,10 @@ class TorreCoolingApp(QMainWindow):
         self.action_ver_pluma.triggered.connect(self.abrir_ventana_pluma)
         self.menu_simulacion.addAction(self.action_ver_pluma)
 
+        # Action to clear saved EPW preference (placed under Settings menu)
+        self.action_clear_epw_choice = QAction(self)
+        self.action_clear_epw_choice.triggered.connect(self._clear_saved_epw_choice)
+
         # MENÚ DE IDIOMA
         self.menu_idioma = menubar.addMenu("Idioma")
         self.action_idioma_es = QAction(self)
@@ -2015,6 +2381,48 @@ class TorreCoolingApp(QMainWindow):
 
         self.menu_idioma.addAction(self.action_idioma_es)
         self.menu_idioma.addAction(self.action_idioma_en)
+        # SETTINGS MENU
+        self.menu_settings = menubar.addMenu(self.tr_txt('menu_settings') if 'menu_settings' in TRANSLATIONS[self.idioma] else 'Settings')
+        self.menu_settings.addAction(self.action_clear_epw_choice)
+        # Reset all preferences action
+        self.action_reset_prefs = QAction(self)
+        self.action_reset_prefs.triggered.connect(self._reset_all_preferences)
+        self.menu_settings.addAction(self.action_reset_prefs)
+        # set texts for language actions and simulation menu items
+        self.action_idioma_es.setText(self.tr_txt('idioma_es'))
+        self.action_idioma_en.setText(self.tr_txt('idioma_en'))
+        # simulation menu items text
+        self.action_sim_dinamica.setText(self.tr_txt('accion_sim_dinamica'))
+        self.action_sim_dinamica.setToolTip(self.tr_txt('tip_sim_dinamica'))
+        self.action_ver_pluma.setText(self.tr_txt('accion_ver_pluma'))
+        self.action_ver_pluma.setToolTip(self.tr_txt('tip_ver_pluma'))
+        self.action_clear_epw_choice.setText(self.tr_txt('sim_clear_epw_choice') if 'sim_clear_epw_choice' in TRANSLATIONS[self.idioma] else 'Clear saved EPW choice')
+        # reset prefs menu item
+        self.action_reset_prefs.setText(self.tr_txt('sim_reset_prefs') if 'sim_reset_prefs' in TRANSLATIONS[self.idioma] else 'Reset all preferences')
+
+    def _clear_saved_epw_choice(self):
+        try:
+            settings = QSettings('cooling_towers', 'tower_app')
+            settings.remove('epw_choice_action')
+            settings.remove('epw_choice_year')
+            QMessageBox.information(self, self.tr_txt('epw_choice_cleared_title'), self.tr_txt('epw_choice_cleared_msg'))
+        except Exception:
+            QMessageBox.warning(self, self.tr_txt('epw_choice_cleared_title'), self.tr_txt('epw_choice_cleared_err'))
+
+    def _reset_all_preferences(self):
+        reply = QMessageBox.question(
+            self,
+            self.tr_txt('reset_prefs_confirm_title'),
+            self.tr_txt('reset_prefs_confirm_msg'),
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                settings = QSettings('cooling_towers', 'tower_app')
+                settings.clear()
+                QMessageBox.information(self, self.tr_txt('reset_prefs_confirm_title'), self.tr_txt('reset_prefs_done_msg'))
+            except Exception:
+                QMessageBox.warning(self, self.tr_txt('reset_prefs_confirm_title'), self.tr_txt('reset_prefs_err_msg'))
 
     def init_ui(self):
         main_widget = QWidget()
@@ -2076,6 +2484,7 @@ class TorreCoolingApp(QMainWindow):
         layout_botones.addWidget(self.btn_calcular)
         layout_botones.addWidget(self.btn_dos_puntos)
         layout_izq.addLayout(layout_botones)
+ 
 
         # Grupo Resultados
         gb_res = QGroupBox()
