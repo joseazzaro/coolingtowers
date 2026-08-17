@@ -3,31 +3,17 @@ import os
 import csv
 import math
 from datetime import datetime, timedelta
+from functools import lru_cache
 import numpy as np
+from scipy.optimize import root_scalar
 
-# Importaciones de módulos refactorizados (separación de responsabilidades)
-from core_calc import (
-    obtener_presion_barometrica,
-    cp_agua_local,
-    humedad_saturacion,
-    entalpia_saturacion,
-    temp_aire_desde_entalpia,
-    simular_torre_2d_matriz,
-    resolver_punto_operacion,
-    CP_WATER_DEFAULT, CP_AIR_DEFAULT, CP_VAPOR_DEFAULT, H_FG0_DEFAULT,
-    HAS_COOLPROP
-)
-from psychro_data import PsicroLUT
-from tower_sim import ControladorPID, CalibracionWorker, SimularDinamicaWorker
-from utils import (
-    leer_archivo_epw,
-    traducir,
-    parse_float_local,
-    conectar_formato_precision,
-    obtener_rango_epw,
-    detectar_multianio_epw,
-    normalizar_epw_a_año_canonico
-)
+# Intento de importación de CoolProp con Fallback Automático
+HAS_COOLPROP = False
+try:
+    import CoolProp.CoolProp as CP
+    HAS_COOLPROP = True
+except ImportError:
+    HAS_COOLPROP = False
 
 # Importaciones de PyQt
 from PyQt5.QtWidgets import (
@@ -49,17 +35,767 @@ from matplotlib.figure import Figure
 import matplotlib.ticker as mticker
 
 # ==========================================
-# CONSTANTES LOCALES (Alias para compatibilidad)
+# 1. CONSTANTES TERMODINÁMICAS Y PSICROMETRÍA
 # ==========================================
-cp_w_def = CP_WATER_DEFAULT       # 4.184 kJ/kg.K
-cp_a_def = CP_AIR_DEFAULT         # 1.006 kJ/kg.K
-cp_v_def = CP_VAPOR_DEFAULT       # 1.86 kJ/kg.K
-h_fg0_def = H_FG0_DEFAULT         # 2501.0 kJ/kg
+cp_w_def = 4.184     # kJ/kg.K
+cp_a_def = 1.006     # kJ/kg.K
+cp_v_def = 1.86      # kJ/kg.K
+h_fg0_def = 2501.0   # kJ/kg
 
+def obtener_presion_barometrica(altitud_m):
+    P0 = 101325.0  # Pa
+    return P0 * (1.0 - 0.6875e-5 * float(altitud_m))**5.2561
 
+@lru_cache(maxsize=4096)
+def cp_agua_local_fast(T_round):
+    if HAS_COOLPROP:
+        try:
+            return float(CP.PropsSI('C', 'T', T_round + 273.15, 'P', 101325, 'Water') / 1000.0)
+        except Exception:
+            pass
+    return cp_w_def
+
+def cp_agua_local(T_celcius):
+    T_clamped = max(-10.0, min(95.0, float(T_celcius)))
+    return cp_agua_local_fast(round(T_clamped, 1))
+
+@lru_cache(maxsize=4096)
+def humedad_saturacion_fast(T_round, P_atm_round):
+    if HAS_COOLPROP:
+        try:
+            val = CP.HAPropsSI('W', 'T', T_round + 273.15, 'R', 1.0, 'P', P_atm_round)
+            if not np.isnan(val) and val > 0:
+                return float(val)
+        except Exception:
+            pass
+    P_atm_kPa = P_atm_round / 1000.0
+    den_temp = T_round + 237.3
+    if abs(den_temp) < 1e-4:
+        den_temp = 1e-4
+    P_sat = 0.61078 * np.exp(max(-50.0, min(50.0, 17.27 * T_round / den_temp)))
+    den_press = P_atm_kPa - P_sat
+    if den_press <= 1e-4:
+        den_press = 1e-4
+    return float(0.622 * P_sat / den_press)
+
+def humedad_saturacion(T, P_atm=101325.0):
+    T_clamped = max(-20.0, min(95.0, float(T)))
+    return humedad_saturacion_fast(round(T_clamped, 1), round(float(P_atm), -2))
+
+def factor_lewis(w_sw, w):
+    w_sw_c = max(0.0, float(w_sw))
+    w_c = max(0.0, float(w))
+    if w_c >= w_sw_c or abs(w_sw_c - w_c) < 1e-6:
+        return 0.865**(2/3)
+    arg = (w_sw_c + 0.622) / (w_c + 0.622)
+    if arg <= 1.0 + 1e-7:
+        return 0.865**(2/3)
+    num = arg - 1.0
+    den = np.log(arg)
+    if den <= 1e-7:
+        return 0.865**(2/3)
+    return (0.865**(2/3)) * (num / den)
+
+@lru_cache(maxsize=4096)
+def entalpia_saturacion_fast(T_round, w_sat_round, P_atm_round):
+    if HAS_COOLPROP:
+        try:
+            val = CP.HAPropsSI('H', 'T', T_round + 273.15, 'W', w_sat_round, 'P', P_atm_round) / 1000.0
+            if not np.isnan(val):
+                return float(val)
+        except Exception:
+            pass
+    return float(cp_a_def * T_round + w_sat_round * (h_fg0_def + cp_v_def * T_round))
+
+def entalpia_saturacion(T, w_sat, P_atm=101325.0):
+    T_clamped = max(-20.0, min(95.0, float(T)))
+    w_clamped = max(0.0, float(w_sat))
+    return entalpia_saturacion_fast(round(T_clamped, 1), round(w_clamped, 4), round(float(P_atm), -2))
+
+def temp_aire_desde_entalpia(h_a, w_a, P_atm=101325.0):
+    h_c = max(-50.0, min(500.0, float(h_a)))
+    w_c = max(0.0, min(0.1, float(w_a)))
+    if HAS_COOLPROP:
+        try:
+            T_kelvin = CP.HAPropsSI('T', 'H', h_c * 1000.0, 'W', w_c, 'P', float(P_atm))
+            if not np.isnan(T_kelvin):
+                return float(T_kelvin - 273.15)
+        except Exception:
+            pass
+    den = cp_a_def + w_c * cp_v_def
+    if abs(den) < 1e-5:
+        den = cp_a_def
+    return float((h_c - w_c * h_fg0_def) / den)
+
+class PsicroLUT:
+    def __init__(self, T_min=-15.0, T_max=65.0, step=0.1, P_atm=101325.0):
+        self.T_min = T_min
+        self.T_max = T_max
+        self.step = step
+        self.P_atm = P_atm
+        
+        self.T_grid = np.arange(T_min, T_max + step, step)
+        self.num_pts = len(self.T_grid)
+        
+        self.ws_lut = np.zeros(self.num_pts)
+        self.hs_lut = np.zeros(self.num_pts)
+        
+        for idx, T in enumerate(self.T_grid):
+            ws = humedad_saturacion(T, P_atm)
+            self.ws_lut[idx] = ws
+            self.hs_lut[idx] = entalpia_saturacion(T, ws, P_atm)
+
+    def get_ws_hs(self, T):
+        idx = int((T - self.T_min) / self.step)
+        if idx < 0:
+            idx = 0
+        elif idx >= self.num_pts:
+            idx = self.num_pts - 1
+        return self.ws_lut[idx], self.hs_lut[idx]
 
 # ==========================================
-# UI DIALOG CLASSES - Main application logic
+# 2. MOTOR POPPE 2D OPTIMIZADO
+# ==========================================
+def simular_torre_2d_matriz(NTU_actual, T_w_in, m_w_total, h_a_in, w_a_in, m_a_total, P_atm=101325.0, Nx=6, Ny=6, lut=None):
+    m_a_total_safe = max(1e-4, float(m_a_total))
+    
+    dm_w = m_w_total / Nx  
+    dm_a = m_a_total_safe / Ny  
+    K_dA = (NTU_actual * m_w_total) / (Nx * Ny) 
+    
+    T_w = np.zeros((Ny + 1, Nx))
+    m_w = np.zeros((Ny + 1, Nx))
+    h_a = np.zeros((Ny, Nx + 1))
+    w_a = np.zeros((Ny, Nx + 1))
+    
+    matriz_niebla = np.zeros((Ny, Nx), dtype=bool)
+    matriz_T_aire = np.zeros((Ny, Nx))
+    
+    T_w[0, :] = T_w_in
+    m_w[0, :] = dm_w
+    h_a[:, 0] = h_a_in
+    w_a[:, 0] = w_a_in
+    
+    for i in range(Ny):      
+        for j in range(Nx):  
+            T_water_cell = T_w[i, j]
+            m_water_cell = m_w[i, j]
+            h_air_cell = h_a[i, j]
+            w_air_cell = w_a[i, j]
+            
+            cp_w_local = cp_agua_local(T_water_cell)
+            
+            if lut is not None:
+                w_sw, h_sw = lut.get_ws_hs(T_water_cell)
+            else:
+                w_sw = humedad_saturacion(T_water_cell, P_atm)
+                h_sw = entalpia_saturacion(T_water_cell, w_sw, P_atm)
+                
+            h_v = h_fg0_def + cp_v_def * T_water_cell
+            Le = factor_lewis(w_sw, w_air_cell)
+            
+            potencial_w = max(0.0, w_sw - w_air_cell)
+            potencial_h = (h_sw - h_air_cell) + (Le - 1) * (h_sw - h_air_cell - potencial_w * h_v) + potencial_w * cp_w_local * T_water_cell
+            
+            agua_evap_celda = K_dA * potencial_w
+            calor_transferido = K_dA * potencial_h
+            
+            w_a_next = w_air_cell + (agua_evap_celda / dm_a)
+            h_a_next = h_air_cell + (calor_transferido / dm_a)
+            
+            w_a[i, j+1] = w_a_next
+            h_a[i, j+1] = h_a_next
+            
+            T_a_next = temp_aire_desde_entalpia(h_a_next, w_a_next, P_atm)
+            matriz_T_aire[i, j] = T_a_next
+            
+            w_sat_local = lut.get_ws_hs(T_a_next)[0] if lut is not None else humedad_saturacion(T_a_next, P_atm)
+            
+            if w_a_next > w_sat_local:
+                matriz_niebla[i, j] = True
+            
+            m_w_next = max(1e-6, m_water_cell - agua_evap_celda)
+            m_w[i+1, j] = m_w_next
+            
+            den_energia = m_w_next * cp_w_local
+            if abs(den_energia) < 1e-6:
+                den_energia = 1e-6
+            T_w[i+1, j] = (m_water_cell * cp_w_local * T_water_cell - calor_transferido) / den_energia
+
+    T_w_salida_final = np.average(T_w[Ny, :], weights=m_w[Ny, :])
+    agua_evaporada_total = max(0.0, m_w_total - np.sum(m_w[Ny, :]))
+    
+    return T_w_salida_final, agua_evaporada_total, T_w[:-1, :], w_a[:, 1:], matriz_T_aire, matriz_niebla
+
+def resolver_punto_operacion(datos_p, N_celdas, worker_ref, pct_base, pct_span):
+    P_atm = obtener_presion_barometrica(datos_p['altitud'])
+    m_w_total = datos_p['caudal_w'] * 1000.0 / 3600.0 
+    m_a_total = datos_p['caudal_a'] * datos_p['densidad_a'] 
+    
+    T_db = datos_p['T_db_in']
+    T_wb = datos_p['T_wb_in']
+    
+    if HAS_COOLPROP:
+        try:
+            w_a_in = CP.HAPropsSI('W', 'T', T_db + 273.15, 'B', T_wb + 273.15, 'P', P_atm)
+            h_a_in = CP.HAPropsSI('H', 'T', T_db + 273.15, 'B', T_wb + 273.15, 'P', P_atm) / 1000.0
+        except Exception:
+            w_sat_wb = humedad_saturacion(T_wb, P_atm)
+            w_a_in = ((h_fg0_def - (cp_w_def - cp_v_def) * T_wb) * w_sat_wb - cp_a_def * (T_db - T_wb)) / (h_fg0_def + cp_v_def * T_db - cp_w_def * T_wb)
+            h_a_in = cp_a_def * T_db + w_a_in * (h_fg0_def + cp_v_def * T_db)
+    else:
+        w_sat_wb = humedad_saturacion(T_wb, P_atm)
+        w_a_in = ((h_fg0_def - (cp_w_def - cp_v_def) * T_wb) * w_sat_wb - cp_a_def * (T_db - T_wb)) / (h_fg0_def + cp_v_def * T_db - cp_w_def * T_wb)
+        h_a_in = cp_a_def * T_db + w_a_in * (h_fg0_def + cp_v_def * T_db)
+
+    num_puntos = 25
+    ntu_puntos = np.linspace(0.1, 10.0, num_puntos)
+    errores = []
+
+    for idx, ntu_val in enumerate(ntu_puntos):
+        if worker_ref._is_cancelled:
+            return None
+
+        pct = pct_base + int((idx / num_puntos) * pct_span)
+        worker_ref.progreso_signal.emit(f"Evaluando malla ({N_celdas}x{N_celdas}) - Paso {idx+1}/{num_puntos}...", pct)
+        
+        T_calc, _, _, _, _, _ = simular_torre_2d_matriz(
+            ntu_val, datos_p['T_w_in'], m_w_total, h_a_in, w_a_in, m_a_total, P_atm,
+            Nx=N_celdas, Ny=N_celdas
+        )
+        errores.append(T_calc - datos_p['T_w_out_target'])
+
+    def objetivo_ntu(NTU_guess):
+        T_calc, _, _, _, _, _ = simular_torre_2d_matriz(
+            NTU_guess, datos_p['T_w_in'], m_w_total, h_a_in, w_a_in, m_a_total, P_atm,
+            Nx=N_celdas, Ny=N_celdas
+        )
+        return T_calc - datos_p['T_w_out_target']
+
+    bracket_encontrado = None
+    for i in range(len(errores) - 1):
+        if errores[i] * errores[i+1] <= 0:
+            bracket_encontrado = [ntu_puntos[i], ntu_puntos[i+1]]
+            break
+
+    if bracket_encontrado is not None:
+        res = root_scalar(objetivo_ntu, bracket=bracket_encontrado, method='brentq')
+        NTU_calibrado = res.root
+    else:
+        res = root_scalar(objetivo_ntu, x0=3.0, x1=4.0, method='secant')
+        NTU_calibrado = res.root
+
+    T_sal, evap_kg, Matriz_T_w, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_2d_matriz(
+        NTU_calibrado, datos_p['T_w_in'], m_w_total, h_a_in, w_a_in, m_a_total, P_atm,
+        Nx=N_celdas, Ny=N_celdas
+    )
+
+    evap_m3h = evap_kg * 3600.0 / 1000.0
+    pct_evap = (evap_m3h / datos_p['caudal_w']) * 100.0
+    range_w = datos_p['T_w_in'] - T_sal
+    approach_w = T_sal - T_wb
+    
+    cp_medio = cp_agua_local((datos_p['T_w_in'] + T_sal) / 2.0)
+    Q_kW = m_w_total * cp_medio * range_w
+    Q_MWt = Q_kW / 1000.0
+    Q_TR = Q_kW / 3.517
+    
+    L_G_ratio = m_w_total / m_a_total
+
+    return {
+        'NTU': NTU_calibrado,
+        'T_salida': T_sal,
+        'evaporacion_m3h': evap_m3h,
+        'pct_evap': pct_evap,
+        'range_w': range_w,
+        'approach_w': approach_w,
+        'Q_MWt': Q_MWt,
+        'Q_TR': Q_TR,
+        'L_G_ratio': L_G_ratio,
+        'Matriz_T_w': Matriz_T_w,
+        'Matriz_w_a': Matriz_w_a * 1000.0,
+        'Matriz_T_a': Matriz_T_a,
+        'Matriz_niebla': Matriz_niebla,
+        'hay_niebla': bool(np.any(Matriz_niebla)),
+        'T_w_in': datos_p['T_w_in'],
+        'num_celdas': N_celdas
+    }
+
+# ==========================================
+# 3. CONTROLADOR PID DISCRETO
+# ==========================================
+class ControladorPID:
+    def __init__(self, Kp=4.0, Ti=300.0, Td=5.0, u_min=0.0, u_max=100.0):
+        self.Kp = float(Kp)
+        self.Ti = max(float(Ti), 1.0)
+        self.Td = float(Td)
+        self.u_min = float(u_min)
+        self.u_max = float(u_max)
+        self.integral = 0.0
+        self.prev_error = None
+
+    def calcular(self, setpoint, medido, dt):
+        error = float(medido - setpoint)
+        if np.isnan(error) or np.isinf(error):
+            error = 0.0
+
+        if self.prev_error is None:
+            self.prev_error = error
+
+        P = self.Kp * error
+        self.integral += error * dt
+        if np.isnan(self.integral) or np.isinf(self.integral):
+            self.integral = 0.0
+
+        I = (self.Kp / self.Ti) * self.integral
+        D = self.Kp * self.Td * (error - self.prev_error) / dt if dt > 0 else 0.0
+        self.prev_error = error
+        
+        u_raw = P + I + D
+        if np.isnan(u_raw) or np.isinf(u_raw):
+            u_raw = self.u_min
+
+        u_sat = max(self.u_min, min(self.u_max, u_raw))
+        
+        if u_raw != u_sat:
+            self.integral -= error * dt
+            if np.isnan(self.integral) or np.isinf(self.integral):
+                self.integral = 0.0
+            
+        return u_sat
+
+# ==========================================
+# 4. PARSER LIGERO DE ARCHIVOS EPW
+# ==========================================
+def leer_archivo_epw(path_epw):
+    """Lee un archivo EPW de forma robusta.
+
+    Busca filas de datos detectando si la primera cuatro columnas son año/mes/día/hora
+    y acepta diferentes longitudes de encabezado. Devuelve una lista de diccionarios
+    con las claves: 'dt','tdb','twb','rh','patm','u_viento'.
+    """
+    datos_clima = []
+
+    def _safe_int(s):
+        try:
+            return int(str(s).strip())
+        except Exception:
+            return None
+
+    def _safe_float(s, default=None):
+        try:
+            return float(str(s).strip().replace(',', '.'))
+        except Exception:
+            return default
+
+    with open(path_epw, 'r', encoding='utf-8', errors='ignore') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row or len(row) < 4:
+                continue
+
+            # limpiar posibles caracteres BOM y espacios
+            try:
+                row0 = row[0].lstrip('\ufeff').strip()
+            except Exception:
+                row0 = str(row[0]).strip()
+
+            anio = _safe_int(row0)
+            mes = _safe_int(row[1])
+            dia = _safe_int(row[2])
+            hora = _safe_int(row[3])
+
+            # aceptar únicamente filas que parezcan datos (rangos plausibles)
+            if anio is None or mes is None or dia is None or hora is None:
+                continue
+            if not (1900 <= anio <= 2100 and 1 <= mes <= 12 and 1 <= dia <= 31 and 1 <= hora <= 24):
+                continue
+
+            # convertir hora EPW (1..24) a 0..23
+            hora_idx = max(0, min(23, hora - 1))
+
+            try:
+                dt = datetime(anio, mes, dia, hora_idx)
+            except Exception:
+                continue
+
+            # columnas típicas de EPW (si faltan, se usan valores por defecto razonables)
+            tdb = _safe_float(row[6], None) if len(row) > 6 else None
+            # intentar columna de punto de rocío/humedad si está disponible
+            tdew = _safe_float(row[7], None) if len(row) > 7 else None
+            rh_raw = _safe_float(row[8], None) if len(row) > 8 else None
+            patm = _safe_float(row[9], None) if len(row) > 9 else None
+
+            if tdb is None or rh_raw is None:
+                # si faltan datos críticos, saltar la fila
+                continue
+
+            # RH en EPW viene en % (0..100)
+            rh = rh_raw / 100.0 if rh_raw is not None else 0.0
+
+            u_viento = _safe_float(row[21], None) if len(row) > 21 else None
+            if u_viento is None:
+                # intentar columnas alternativas comunes (ej. 20)
+                if len(row) > 20:
+                    u_viento = _safe_float(row[20], 3.5)
+                else:
+                    u_viento = 3.5
+
+            # aproximación rápida de Twb si no hay columna directa
+            try:
+                twb = float(tdb) * np.arctan(0.151977 * (rh * 100.0 + 8.313659) ** 0.5) + np.arctan(float(tdb) + rh * 100.0) - np.arctan(rh * 100.0 - 1.676331) + 0.00391838 * (rh * 100.0) ** 1.5 * np.arctan(0.023101 * rh * 100.0) - 4.686035
+            except Exception:
+                twb = float(tdb)
+
+            datos_clima.append({
+                'dt': dt,
+                'tdb': float(tdb),
+                'twb': float(twb),
+                'rh': float(rh),
+                'patm': float(patm) if patm is not None else 101325.0,
+                'u_viento': float(u_viento)
+            })
+
+    return datos_clima
+
+# ==========================================
+# 5. HILO DE SIMULACIÓN DINÁMICA
+# ==========================================
+class CalibracionWorker(QThread):
+    progreso_signal = pyqtSignal(str, int)
+    exito_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+    cancelado_signal = pyqtSignal()
+
+    def __init__(self, datos_input_p1, datos_input_p2=None):
+        super().__init__()
+        self.d1 = datos_input_p1
+        self.d2 = datos_input_p2
+        self._is_cancelled = False
+
+    def cancelar(self):
+        self._is_cancelled = True
+
+    def run(self):
+        try:
+            N_celdas = self.d1['num_celdas']
+
+            if self.d2 is None:
+                res1 = resolver_punto_operacion(self.d1, N_celdas, self, pct_base=5, pct_span=85)
+                if res1 is None or self._is_cancelled:
+                    self.cancelado_signal.emit()
+                    return
+                
+                res1['es_dual'] = False
+                self.progreso_signal.emit("Completado", 100)
+                self.exito_signal.emit(res1)
+
+            else:
+                self.progreso_signal.emit("Calibrando Punto 1...", 5)
+                res1 = resolver_punto_operacion(self.d1, N_celdas, self, pct_base=5, pct_span=40)
+                if res1 is None or self._is_cancelled:
+                    self.cancelado_signal.emit()
+                    return
+
+                self.progreso_signal.emit("Calibrando Punto 2...", 50)
+                res2 = resolver_punto_operacion(self.d2, N_celdas, self, pct_base=50, pct_span=40)
+                if res2 is None or self._is_cancelled:
+                    self.cancelado_signal.emit()
+                    return
+
+                lg1 = res1['L_G_ratio']
+                lg2 = res2['L_G_ratio']
+                ntu1 = res1['NTU']
+                ntu2 = res2['NTU']
+
+                if abs(lg1 - lg2) < 1e-5:
+                    m_exp = 0.6
+                else:
+                    m_exp = - np.log(ntu1 / ntu2) / np.log(lg1 / lg2)
+
+                c_coef = ntu1 / (lg1 ** (-m_exp))
+
+                res1['es_dual'] = True
+                res1['c_coef'] = c_coef
+                res1['m_exp'] = m_exp
+                res1['p2'] = res2
+
+                self.progreso_signal.emit("Ajuste de 2 puntos completado", 100)
+                self.exito_signal.emit(res1)
+
+        except Exception as e:
+            if not self._is_cancelled:
+                self.error_signal.emit(str(e))
+
+class SimularDinamicaWorker(QThread):
+    progreso_signal = pyqtSignal(str, int)
+    exito_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+    cancelado_signal = pyqtSignal()
+
+    def __init__(self, config_sim):
+        super().__init__()
+        self.cfg = config_sim
+        self._is_cancelled = False
+
+    def cancelar(self):
+        self._is_cancelled = True
+
+    def run(self):
+        try:
+            self.progreso_signal.emit("Cargando y procesando archivo climático EPW...", 5)
+            clima = leer_archivo_epw(self.cfg['path_epw'])
+            if not clima:
+                raise ValueError("No se pudieron extraer datos válidos del archivo EPW.")
+
+            # Si la configuración solicita normalizar a un único año, aplicar aquí
+            if self.cfg.get('epw_normalize'):
+                target_year = int(self.cfg.get('epw_normalize_year') or 2000)
+                clima_norm = []
+                for r in clima:
+                    dt0 = r['dt']
+                    m = dt0.month
+                    d = dt0.day
+                    h = dt0.hour
+                    try:
+                        ndt = datetime(target_year, m, d, h)
+                    except ValueError:
+                        # fallback: try common valid day choices (handle Feb 29)
+                        ndt = None
+                        for dd in (28, 27, 26, 25):
+                            try:
+                                ndt = datetime(target_year, m, dd, h)
+                                break
+                            except Exception:
+                                ndt = None
+                        if ndt is None:
+                            ndt = datetime(target_year, m, max(1, min(28, d)), h)
+                    nr = dict(r)
+                    nr['dt'] = ndt
+                    clima_norm.append(nr)
+                clima = clima_norm
+
+            f_ini = self.cfg['fecha_inicio']
+            f_fin = self.cfg['fecha_fin']
+            clima_filtrado = [c for c in clima if f_ini <= c['dt'] <= f_fin]
+            
+            if not clima_filtrado:
+                raise ValueError("El rango de fechas seleccionado no coincide con el archivo EPW.")
+
+            dt_sim_sec = self.cfg['dt_sim_sec']
+            
+            t_epw_sec = np.array([(c['dt'] - clima_filtrado[0]['dt']).total_seconds() for c in clima_filtrado])
+            tdb_epw = np.array([c['tdb'] for c in clima_filtrado])
+            twb_epw = np.array([c['twb'] for c in clima_filtrado])
+            patm_epw = np.array([c['patm'] for c in clima_filtrado])
+            uviento_epw = np.array([c['u_viento'] for c in clima_filtrado])
+
+            t_total_sec = t_epw_sec[-1]
+            time_steps_sec = np.arange(0, t_total_sec + dt_sim_sec, dt_sim_sec)
+            total_pasos = len(time_steps_sec)
+
+            self.progreso_signal.emit("Pre-interpolando vectores climáticos con NumPy...", 7)
+            tdb_vec = np.interp(time_steps_sec, t_epw_sec, tdb_epw)
+            twb_vec = np.interp(time_steps_sec, t_epw_sec, twb_epw)
+            patm_vec = np.interp(time_steps_sec, t_epw_sec, patm_epw)
+            uviento_vec = np.interp(time_steps_sec, t_epw_sec, uviento_epw)
+
+            self.progreso_signal.emit("Inicializando Tabla Psicrométrica Fast-LUT...", 9)
+            lut = PsicroLUT(T_min=-15.0, T_max=65.0, step=0.1, P_atm=patm_epw[0])
+
+            w_sat_wb_vec = np.array([lut.get_ws_hs(twb_vec[k])[0] for k in range(total_pasos)])
+            w_a_in_vec = ((h_fg0_def - (cp_w_def - cp_v_def) * twb_vec) * w_sat_wb_vec - cp_a_def * (tdb_vec - twb_vec)) / (h_fg0_def + cp_v_def * tdb_vec - cp_w_def * twb_vec)
+            h_a_in_vec = cp_a_def * tdb_vec + w_a_in_vec * (h_fg0_def + cp_v_def * tdb_vec)
+
+            pid = ControladorPID(
+                Kp=self.cfg['kp'], Ti=self.cfg['ti'], Td=self.cfg['td'],
+                u_min=self.cfg['speed_min'], u_max=100.0
+            )
+
+            caudal_w_m3h = self.cfg['caudal_w_m3h']
+            m_w_nom = caudal_w_m3h * 1000.0 / 3600.0
+            m_a_nom = self.cfg['caudal_a_m3s'] * self.cfg['densidad_a']
+            NTU_ref = self.cfg['ntu_ref']
+            T_set = self.cfg['t_setpoint']
+
+            pct_drift = float(self.cfg.get('pct_drift', 0.005))
+            coc = float(self.cfg.get('coc', 4.0))
+
+            v_estanque_m3 = self.cfg['vol_estanque_m3']
+            m_estanque_kg = max(100.0, v_estanque_m3 * 1000.0)
+            tau_sec = m_estanque_kg / m_w_nom
+            
+            delta_T_proceso = self.cfg['t_w_in_nom'] - T_set
+
+            p_motor_nom_kw = self.cfg['p_motor_kw']
+            eta_glob = max(0.1, min(1.0, self.cfg['eta_fan_pct'] / 100.0))
+
+            T_piscina = T_set + 0.2
+            T_w_in_dinamica = T_piscina + delta_T_proceso
+
+            tdb_0 = tdb_vec[0]
+            twb_0 = twb_vec[0]
+            patm_0 = patm_vec[0]
+            w_a_in0 = w_a_in_vec[0]
+            h_a_in0 = h_a_in_vec[0]
+
+            for _ in range(20):
+                u_init = pid.calcular(T_set, T_piscina, dt_sim_sec)
+                m_a_init = max(1e-4, m_a_nom * (u_init / 100.0))
+                T_sal_init, _, _, _, _, _ = simular_torre_2d_matriz(
+                    NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, Nx=6, Ny=6, lut=lut
+                )
+                T_sal_init = max(twb_0, min(T_w_in_dinamica, T_sal_init))
+                T_piscina = T_piscina + min(1.0, dt_sim_sec / tau_sec) * (T_sal_init - T_piscina)
+                T_w_in_dinamica = T_piscina + delta_T_proceso
+
+            times, t_out_arr, t_in_arr, fan_speed_arr, t_wb_arr, t_db_arr, t_a_out_arr, evap_arr, q_mwt_arr, niebla_arr = [], [], [], [], [], [], [], [], [], []
+            w_a_out_arr = []  # Outlet air humidity ratio array
+            power_kw_arr = []
+            
+            energia_acum_kwh = 0.0
+            energia_disipada_mwh_t = 0.0
+            agua_evap_total_m3 = 0.0
+            agua_drift_total_m3 = 0.0
+            agua_purga_total_m3 = 0.0
+
+            fraccion_renovacion = min(1.0, dt_sim_sec / tau_sec)
+            drift_m3h = caudal_w_m3h * (pct_drift / 100.0)
+
+            for idx in range(total_pasos):
+                if self._is_cancelled:
+                    self.cancelado_signal.emit()
+                    return
+
+                if idx % max(1, total_pasos // 50) == 0:
+                    pct = int(10 + (idx / total_pasos) * 85)
+                    sec = time_steps_sec[idx]
+                    dt_actual = clima_filtrado[0]['dt'] + timedelta(seconds=float(sec))
+                    self.progreso_signal.emit(f"Simulando {dt_actual.strftime('%d/%m %H:%M')}...", pct)
+
+                tdb_k = tdb_vec[idx]
+                twb_k = twb_vec[idx]
+                patm_k = patm_vec[idx]
+                w_a_in_k = w_a_in_vec[idx]
+                h_a_in_k = h_a_in_vec[idx]
+
+                velocidad_pct = pid.calcular(T_set, T_piscina, dt_sim_sec)
+                m_a_actual = max(1e-4, m_a_nom * (velocidad_pct / 100.0))
+
+                u_ratio = velocidad_pct / 100.0
+                p_elec_instantanea_kw = (p_motor_nom_kw / eta_glob) * (u_ratio ** 3)
+                energia_acum_kwh += p_elec_instantanea_kw * (dt_sim_sec / 3600.0)
+
+                T_salida_inst, evap_kg_s, _, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_2d_matriz(
+                    NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
+                    Nx=6, Ny=6, lut=lut
+                )
+
+                T_salida_inst = max(twb_k, min(T_w_in_dinamica, T_salida_inst))
+                T_a_out_prom = np.mean(Matriz_T_a[:, -1])
+                w_a_out_prom = np.mean(Matriz_w_a[:, -1])  # Outlet air humidity ratio
+                hay_niebla_paso = bool(np.any(Matriz_niebla))
+
+                T_piscina = T_piscina + fraccion_renovacion * (T_salida_inst - T_piscina)
+                T_piscina = max(twb_k, min(T_w_in_dinamica, T_piscina))
+
+                T_w_in_dinamica = T_piscina + delta_T_proceso
+
+                evap_m3h = max(0.0, evap_kg_s * 3600.0 / 1000.0)
+                purga_m3h = max(0.0, (evap_m3h - drift_m3h * (coc - 1.0)) / (coc - 1.0))
+                
+                dt_horas = (dt_sim_sec / 3600.0)
+                agua_evap_total_m3 += evap_m3h * dt_horas
+                agua_drift_total_m3 += drift_m3h * dt_horas
+                agua_purga_total_m3 += purga_m3h * dt_horas
+
+                Q_MWt = (m_w_nom * cp_w_def * delta_T_proceso) / 1000.0
+                energia_disipada_mwh_t += Q_MWt * dt_horas
+
+                dt_actual = clima_filtrado[0]['dt'] + timedelta(seconds=float(time_steps_sec[idx]))
+                times.append(dt_actual)
+                t_out_arr.append(T_piscina)
+                t_in_arr.append(T_w_in_dinamica)
+                fan_speed_arr.append(velocidad_pct)
+                t_wb_arr.append(twb_k)
+                t_db_arr.append(tdb_k)
+                t_a_out_arr.append(T_a_out_prom)
+                w_a_out_arr.append(w_a_out_prom)  # Store outlet air humidity
+                evap_arr.append(evap_m3h)
+                q_mwt_arr.append(Q_MWt)
+                niebla_arr.append(hay_niebla_paso)
+                power_kw_arr.append(p_elec_instantanea_kw)
+
+            agua_total_makeup_m3 = agua_evap_total_m3 + agua_drift_total_m3 + agua_purga_total_m3
+            energia_disipada_kwh_t = energia_disipada_mwh_t * 1000.0
+            
+            cop_torre = (energia_disipada_kwh_t / energia_acum_kwh) if energia_acum_kwh > 0 else 0.0
+            intensidad_agua_m3_mwh = (agua_total_makeup_m3 / energia_disipada_mwh_t) if energia_disipada_mwh_t > 0 else 0.0
+            intensidad_agua_m3_kwhe = (agua_total_makeup_m3 / energia_acum_kwh) if energia_acum_kwh > 0 else 0.0
+            
+            vel_promedio_pct = float(np.mean(fan_speed_arr))
+
+            res = {
+                'times': times,
+                't_out': t_out_arr,
+                't_in': t_in_arr,
+                'fan_speed': fan_speed_arr,
+                't_wb': t_wb_arr,
+                't_db': t_db_arr,
+                't_a_out': t_a_out_arr,
+                'w_a_out': w_a_out_arr,  # Outlet air humidity ratio (kg/kg)
+                'evap': evap_arr,
+                'q_mwt': q_mwt_arr,
+                'niebla': niebla_arr,
+                'power_kw': power_kw_arr,
+                'u_viento_vec': uviento_vec,  # <--- ¡AQUÍ ESTÁ EL CAMBIO CLAVE!
+                'energia_total_kwh': energia_acum_kwh,
+                'energia_disipada_mwh_t': energia_disipada_mwh_t,
+                'agua_evap_m3': agua_evap_total_m3,
+                'agua_drift_m3': agua_drift_total_m3,
+                'agua_purga_m3': agua_purga_total_m3,
+                'agua_total_makeup_m3': agua_total_makeup_m3,
+                'cop_torre': cop_torre,
+                'intensidad_agua_m3_mwh': intensidad_agua_m3_mwh,
+                'intensidad_agua_m3_kwhe': intensidad_agua_m3_kwhe,
+                'vel_promedio_pct': vel_promedio_pct,
+                't_setpoint': T_set,
+                'viento_medio': float(np.mean(uviento_vec)),
+                'caudal_a_m3s': self.cfg['caudal_a_m3s'],
+                'p_motor_kw': self.cfg['p_motor_kw']
+            }
+
+            self.progreso_signal.emit("Finalizado", 100)
+            self.exito_signal.emit(res)
+
+        except Exception as e:
+            if not self._is_cancelled:
+                self.error_signal.emit(str(e))
+
+def parse_float_local(text):
+    return float(text.replace(',', '.'))
+
+def conectar_formato_precision(txt_widget, precision=1):
+    """Reformatea el contenido de un QLineEdit numérico a una precisión fija
+    (mínimo 1 decimal) cada vez que el campo pierde el foco."""
+    def _formatear():
+        try:
+            val = parse_float_local(txt_widget.text())
+            txt_widget.setText(f"{val:.{max(1, precision)}f}")
+        except ValueError:
+            pass
+    txt_widget.editingFinished.connect(_formatear)
+    return _formatear
+
+def traducir(idioma, key, **kwargs):
+    texto = TRANSLATIONS[idioma][key]
+    return texto.format(**kwargs) if kwargs else texto
+
+# ==========================================
+# 6. DIÁLOGO EMERGENTE DE PERFIL DE PLUMA BRIGGS 2D
+# ==========================================
+# ==========================================
+# DIÁLOGO EMERGENTE PARA EL 2º PUNTO
 # ==========================================
 class DialogoSegundoPunto(QDialog):
     def __init__(self, parent=None, datos_p1=None, idioma='es'):
@@ -1282,6 +2018,408 @@ class MplCanvas(FigureCanvas):
         self.draw()
 
 # ==========================================
+# TRADUCCIONES DE LA INTERFAZ (ES / EN)
+# ==========================================
+TRANSLATIONS = {
+    'es': {
+        'title': "CTSim - Gemelo Digital 2D - Torre de Enfriamiento (Poppe)",
+        'menu_simulacion': "Simulación",
+        'menu_idioma': "Idioma",
+        'idioma_es': "Español",
+        'idioma_en': "English",
+        'accion_sim_dinamica': "Simulación Dinámica EPW (Control PID)...",
+        'tip_sim_dinamica': "Ejecutar simulación dinámica anual con archivo EPW y control PID del ventilador",
+        'accion_ver_pluma': "Ver Perfil de Pluma Atmosférica (Briggs 2D)...",
+        'tip_ver_pluma': "Visualizar elevación y dispersión de la pluma de humedad según modelo Briggs 2D",
+        'gb_agua': "Parámetros del Agua (Punto 1)",
+        'gb_aire': "Condiciones Ambientales y Malla",
+        'gb_res': "Resultados de Diagnóstico Térmico",
+        'lbl_Tw_in': "Temp. Entrada Agua (T_w1):",
+        'lbl_Tw_out': "Temp. Salida Deseada (T_w2):",
+        'lbl_caudal_w': "Caudal Volumétrico Agua:",
+        'lbl_Tdb_in': "Temp. Bulbo Seco (T_db):",
+        'lbl_Twb_in': "Temp. Bulbo Húmedo (T_wb):",
+        'lbl_caudal_a': "Caudal Aire Ventilador:",
+        'lbl_densidad_a': "Densidad del Aire:",
+        'lbl_altitud': "Altitud del Sitio:",
+        'lbl_num_celdas': "Resolución Malla (NxN):",
+        'btn_calcular': "Calibrar NTU",
+        'btn_dos_puntos': "Ajuste 2 Puntos",
+        'lbl_combo': "Variable a Visualizar en la Matriz 2D:",
+        'combo_tw': "Temperatura del Agua (Tw)",
+        'combo_wa': "Humedad Absoluta del Aire (wa)",
+        'combo_ta': "Temperatura del Aire (Ta)",
+        'status_default': "Primero presione 'Calibrar NTU' para habilitar la simulación dinámica EPW. [{engine}]",
+        'res_ntu_label': "NTU Calibrado (P1):",
+        'res_merkel_label': "Modelo Merkel:",
+        'res_merkel_1p': "(Ajuste 1 Punto)",
+        'res_q_label': "Carga Térmica:",
+        'res_range_label': "Range (ΔTw):",
+        'res_approach_label': "Approach:",
+        'res_lg_label': "Relación Masa (L/G):",
+        'res_evap_label': "Evaporación:",
+        'res_niebla_label': "Estado Pluma/Niebla:",
+        'res_niebla_si': "DETECTADA (Supersaturación)",
+        'res_niebla_no': "Sin Niebla (Aire no saturado)",
+        'msg_2p_exito': "Ajuste de 2 Puntos Exitoso! c={c:.3f}, m={m:.3f}. Simulación activada.",
+        'msg_1p_exito': "Calibración exitosa. NTU = {ntu:.4f}. Simulación activada.",
+        'msg_cancelado': "Calibración cancelada por el usuario.",
+        'title_error_calib': "Error de Calibración",
+        'msg_error_calib': "No se pudo calibrar:\n{err}",
+        'title_entrada_invalida': "Entrada Inválida",
+        'msg_entrada_invalida_1p': "Verifique que todos los campos contengan números válidos.",
+        'msg_entrada_invalida_2p': "Verifique que todos los campos del Punto 1 sean válidos.",
+        'title_calibracion_requerida': "Calibración Requerida",
+        'msg_calibracion_requerida': "Debe calibrar la torre en la pantalla principal antes de iniciar la simulación dinámica.",
+        'title_simulacion_requerida': "Simulación Requerida",
+        'msg_simulacion_requerida': "Debe ejecutar una simulación dinámica antes de visualizar el perfil de pluma.",
+
+        # --- Diálogo 2º Punto ---
+        'dlg2p_title': "Configuración del 2º Punto de Funcionamiento",
+        'dlg2p_info': "Ingrese las condiciones medidas para la 2ª prueba operativa:",
+        'dlg2p_gb': "Condiciones del Punto 2",
+        'dlg2p_Tw_out': "Temp. Salida Agua (T_w2):",
+        'dlg2p_btn_ok': "Calibrar Ambas Condiciones",
+
+        # --- Diálogo Perfil de Pluma ---
+        'pluma_title': "Perfil Atmosférico de Pluma y Dispersión Hora a Hora (Briggs 2D)",
+        'pluma_info': "Análisis Dinámico de Dispersión de Pluma Atmosférica y Riesgo de Recirculación",
+        'pluma_gb_geom': "Parámetros Geométricos de la Estructura",
+        'pluma_lbl_diametro': "Diámetro Boca Ventilador:",
+        'pluma_lbl_altura': "Altura Estructura Torre:",
+        'pluma_kpis_default': "Seleccione una hora para evaluar el perfil...",
+        'pluma_gb_control': "Navegación Temporal en el Período Simulado",
+        'pluma_fecha_default': "Fecha/Hora: --/--/---- --:--",
+        'pluma_btn_worst': "📍 Ir a Máxima Pluma",
+        'pluma_torre_label': "Torre de Enfriamiento",
+        'pluma_visible_label': "Pluma Visible (Saturación/Niebla)",
+        'pluma_eje_central': "Eje Central",
+        'pluma_eje_dispersion': "Eje de Dispersión Térmica",
+        'pluma_viento_inst': "Viento Inst.: {u:.1f} m/s",
+        'pluma_xlabel': "Distancia Horizontal en Dirección del Viento (m)",
+        'pluma_ylabel': "Altura sobre el Suelo (m)",
+        'pluma_titulo': "Instante: {fecha} | v0={v0:.1f} m/s | T_salida={tsal:.1f}°C | T_amb={tamb:.1f}°C",
+        'pluma_riesgo_critico': "CRÍTICO (Viento vence el tiro del ventilador)",
+        'pluma_riesgo_moderado': "MODERADO (Deflexión severa)",
+        'pluma_riesgo_bajo': "BAJO (Flotabilidad térmica estable)",
+        'pluma_kpi_texto': "<b>Velocidad Descarga (v0):</b> {v0:.1f} m/s | <b>Longitud Pluma Visible:</b> {l:.1f} m | <b>Altura Máxima:</b> {h:.1f} m | <b>Riesgo Recirculación:</b> {riesgo}",
+        'pluma_fecha_texto': "📅 {fecha}",
+
+        # --- Ventana Simulación Dinámica EPW ---
+        'sim_title': "Simulación Dinámica Anual / Climática (.EPW) con PID y Balance Hídrico",
+        'sim_gb_epw': "1. Archivo Climático EPW",
+        'sim_epw_placeholder': "Seleccione archivo .epw...",
+        'sim_btn_examinar': "Examinar...",
+        'sim_gb_tiempo': "2. Rango Temporal, Estanque y Purga",
+        'sim_lbl_fecha_ini': "Fecha Inicio:",
+        'sim_lbl_fecha_fin': "Fecha Fin:",
+        'sim_lbl_dt': "Paso Tiempo Δt:",
+        'sim_lbl_vol_estanque': "Vol. Estanque:",
+        'sim_lbl_coc': "Ciclos Concentración (COC):",
+        'sim_lbl_drift': "Arrastre / Drift:",
+        'sim_gb_pid': "3. Controlador PID del Ventilador",
+        'sim_lbl_setpoint': "Setpoint Temp. Agua:",
+        'sim_lbl_kp': "Ganancia Kp:",
+        'sim_lbl_ti': "Tiempo Integral Ti:",
+        'sim_lbl_td': "Tiempo Derivativo Td:",
+        'sim_lbl_speed_min': "Velocidad Mínima:",
+        'sim_gb_motor': "4. Motor y Eficiencia",
+        'sim_lbl_p_motor': "Potencia Motor:",
+        'sim_lbl_eta_fan': "Eficiencia Global:",
+        'sim_btn_ejecutar': "Simular",
+        'sim_gb_kpi': "📊 Balance de Agua y KPIs del Período",
+        'sim_kpi_q_disipada': "Energía Disipada:",
+        'sim_kpi_kwh_total': "Energía Consumida:",
+        'sim_kpi_m3_evap': "Agua Evaporada (E):",
+        'sim_kpi_m3_purga': "Agua Purga (B):",
+        'sim_kpi_m3_drift': "Agua Arrastre (D):",
+        'sim_kpi_m3_total': "Reposición Total (Make-up):",
+        'sim_kpi_cop': "Rendimiento (COP):",
+        'sim_kpi_int_agua': "Consumo Espec. Agua:",
+        'sim_gb_vars': "Variables a Graficar",
+        'chk_tin': "Temp. Entrada Agua Tw1 (°C)",
+        'chk_tout': "Temp. Salida Agua Tw2 (°C)",
+        'chk_speed': "Velocidad Ventilador (%)",
+        'chk_power': "Potencia Eléctrica (kW)",
+        'chk_twb': "Bulbo Húmedo Twb (°C)",
+        'chk_tdb': "Bulbo Seco Ext. Tdb (°C)",
+        'chk_taout': "Temp. Salida Aire Ta,out (°C)",
+        'chk_niebla': "Presencia Niebla (Sombra)",
+        'chk_q': "Carga Térmica (MWt)",
+        'chk_evap': "Evaporación (m³/h)",
+        'sim_dlg_examinar_title': "Seleccionar archivo climático EPW",
+        'sim_dlg_examinar_filter': "Archivos EPW (*.epw);;Todos los archivos (*.*)",
+        'epw_multi_title': "EPW: Archivo con Múltiples Años Detectado",
+        'epw_multi_info': "El archivo EPW contiene filas originadas en varios años. ¿Cómo desea tratarlas?",
+        'epw_multi_preserve': "Preservar años originales (mantener datetimes tal cual)",
+        'epw_multi_normalize': "Normalizar a un solo año:",
+        'epw_multi_years_present': "Años presentes en el archivo: {years}",
+        'epw_multi_remember': "Recordar mi elección",
+        'epw_choice_cleared_title': "Preferencia EPW borrada",
+        'epw_choice_cleared_msg': "La preferencia guardada para archivos EPW ha sido eliminada.",
+        'epw_choice_cleared_err': "No se pudo eliminar la preferencia guardada.",
+        'sim_clear_epw_choice': "Borrar preferencia EPW guardada",
+        'menu_settings': "Configuración",
+        'sim_reset_prefs': "Restablecer todas las preferencias",
+        'reset_prefs_confirm_title': "Restablecer Preferencias",
+        'reset_prefs_confirm_msg': "¿Desea restablecer todas las preferencias de la aplicación a sus valores por defecto?",
+        'reset_prefs_done_msg': "Preferencias restablecidas correctamente.",
+        'reset_prefs_err_msg': "No se pudieron restablecer las preferencias.",
+        'title_archivo_faltante': "Archivo Faltante",
+        'msg_archivo_faltante': "Por favor seleccione un archivo .epw válido.",
+        'title_sim_pid': "Simulación Dinámica PID",
+        'sim_iniciando': "Iniciando simulación temporal...",
+        'msg_entrada_invalida_sim': "Por favor revise los parámetros numéricos ingresados.",
+        'title_error_sim': "Error de Simulación",
+        'msg_error_sim': "Ocurrió un error:\n{err}",
+
+        # --- Exportación CSV ---
+        'sim_btn_csv': "💾 Exportar",
+        'sim_csv_dialog_title': "Guardar Resultados como CSV",
+        'sim_csv_filter': "Archivos CSV (*.csv)",
+        'title_sin_datos': "Sin Datos",
+        'msg_sin_datos_csv': "Debe ejecutar una simulación antes de exportar resultados.",
+        'msg_sin_variables_csv': "Seleccione al menos una variable para exportar.",
+        'title_csv_exportado': "Exportación Exitosa",
+        'msg_csv_exportado': "Resultados exportados exitosamente a:\n{path}",
+        'title_error_csv': "Error de Exportación",
+        'msg_error_csv': "No se pudo exportar el archivo:\n{err}",
+        'csv_col_fecha': "Fecha/Hora",
+
+        # --- Gráficos dinámicos (replot) ---
+        'plot_niebla_activa': "Pluma/Niebla Activa",
+        'plot_tin': "Temp. Entrada Agua Tw1 (°C)",
+        'plot_tout': "Temp. Salida Agua Tw2 (°C)",
+        'plot_setpoint': "Setpoint Agua",
+        'plot_saturation': "Saturación (ws)",
+        'plot_twb': "Bulbo Húmedo Twb (°C)",
+        'plot_tdb': "Bulbo Seco Tdb (°C)",
+        'plot_taout': "Temp. Salida Aire Ta,out (°C)",
+        'plot_ylabel_temp': "Temperatura (°C)",
+        'plot_speed': "Velocidad Ventilador (%)",
+        'plot_ylabel_vel': "Velocidad (%)",
+        'plot_power': "Potencia Eléctrica (kW)",
+        'plot_ylabel_pow': "Potencia (kW)",
+        'plot_q': "Carga Térmica (MWt)",
+        'plot_ylabel_carga': "Carga (MWt)",
+        'plot_evap': "Evaporación (m³/h)",
+        'plot_ylabel_evap': "Evaporación (m³/h)",
+        'plot_xlabel_fecha': "Fecha / Hora",
+
+        # --- Mapa 2D (MplCanvas) ---
+        'mapa2d_cbar_tw': "Temperatura del Agua (°C)",
+        'mapa2d_cbar_wa': "Humedad Absoluta (g vapor / kg aire)",
+        'mapa2d_cbar_ta': "Temp. Bulbo Seco Aire (°C)",
+        'mapa2d_zona_niebla': "Zona de Niebla",
+        'mapa2d_frente_condensacion': "Frente de Condensación",
+        'mapa2d_titulo': "Mapa 2D ({n}x{n}): {capa}   (NTU = {ntu:.4f})  [{motor}]\nEntrada Techo: {tin:.1f} °C   |   Piscina Mezclada: {tsal:.2f} °C",
+        'mapa2d_xlabel': "Entrada Aire Ambiente   →   Dirección del Flujo de Aire   →   Salida",
+        'mapa2d_ylabel': "← Caída del Agua (Techo a Piscina) →",
+        'accion_ver_psicrometrico': "Ver Carta Psicrométrica...",
+        'tip_ver_psicrometrico': "Mostrar la evolución en la carta psicrométrica con control por tiempo",
+    },
+    'en': {
+        'title': "CTSim - 2D Digital Twin - Cooling Tower (Poppe)",
+        'menu_simulacion': "Simulation",
+        'menu_idioma': "Language",
+        'idioma_es': "Español",
+        'idioma_en': "English",
+        'accion_sim_dinamica': "Dynamic EPW Simulation (PID Control)...",
+        'tip_sim_dinamica': "Run annual dynamic simulation with EPW file and fan PID control",
+        'accion_ver_pluma': "View Atmospheric Plume Profile (Briggs 2D)...",
+        'tip_ver_pluma': "Visualize elevation and dispersion of the moisture plume using the Briggs 2D model",
+        'gb_agua': "Water Parameters (Point 1)",
+        'gb_aire': "Ambient Conditions and Grid",
+        'gb_res': "Thermal Diagnostic Results",
+        'lbl_Tw_in': "Water Inlet Temp. (T_w1):",
+        'lbl_Tw_out': "Desired Outlet Temp. (T_w2):",
+        'lbl_caudal_w': "Water Volumetric Flow:",
+        'lbl_Tdb_in': "Dry Bulb Temp. (T_db):",
+        'lbl_Twb_in': "Wet Bulb Temp. (T_wb):",
+        'lbl_caudal_a': "Fan Air Flow:",
+        'lbl_densidad_a': "Air Density:",
+        'lbl_altitud': "Site Altitude:",
+        'lbl_num_celdas': "Grid Resolution (NxN):",
+        'btn_calcular': "Calibrate NTU",
+        'btn_dos_puntos': "2-Point Fit",
+        'lbl_combo': "Variable to Display in 2D Grid:",
+        'combo_tw': "Water Temperature (Tw)",
+        'combo_wa': "Air Humidity Ratio (wa)",
+        'combo_ta': "Air Temperature (Ta)",
+        'status_default': "First press 'Calibrate NTU' to enable the dynamic EPW simulation. [{engine}]",
+        'res_ntu_label': "Calibrated NTU (P1):",
+        'res_merkel_label': "Merkel Model:",
+        'res_merkel_1p': "(1-Point Fit)",
+        'res_q_label': "Thermal Load:",
+        'res_range_label': "Range (ΔTw):",
+        'res_approach_label': "Approach:",
+        'res_lg_label': "Mass Ratio (L/G):",
+        'res_evap_label': "Evaporation:",
+        'res_niebla_label': "Plume/Fog Status:",
+        'res_niebla_si': "DETECTED (Supersaturation)",
+        'res_niebla_no': "No Fog (Unsaturated Air)",
+        'msg_2p_exito': "2-Point Fit Successful! c={c:.3f}, m={m:.3f}. Simulation enabled.",
+        'msg_1p_exito': "Calibration successful. NTU = {ntu:.4f}. Simulation enabled.",
+        'msg_cancelado': "Calibration cancelled by the user.",
+        'title_error_calib': "Calibration Error",
+        'msg_error_calib': "Could not calibrate:\n{err}",
+        'title_entrada_invalida': "Invalid Input",
+        'msg_entrada_invalida_1p': "Please check that all fields contain valid numbers.",
+        'msg_entrada_invalida_2p': "Please check that all Point 1 fields are valid.",
+        'title_calibracion_requerida': "Calibration Required",
+        'msg_calibracion_requerida': "You must calibrate the tower on the main screen before starting the dynamic simulation.",
+        'title_simulacion_requerida': "Simulation Required",
+        'msg_simulacion_requerida': "You must run a dynamic simulation before viewing the plume profile.",
+
+        # --- Point 2 Dialog ---
+        'dlg2p_title': "Operating Point 2 Configuration",
+        'dlg2p_info': "Enter the conditions measured for the 2nd operating test:",
+        'dlg2p_gb': "Point 2 Conditions",
+        'dlg2p_Tw_out': "Water Outlet Temp. (T_w2):",
+        'dlg2p_btn_ok': "Calibrate Both Conditions",
+
+        # --- Plume Profile Dialog ---
+        'pluma_title': "Atmospheric Plume Profile and Hourly Dispersion (Briggs 2D)",
+        'pluma_info': "Dynamic Analysis of Atmospheric Plume Dispersion and Recirculation Risk",
+        'pluma_gb_geom': "Structure Geometric Parameters",
+        'pluma_lbl_diametro': "Fan Outlet Diameter:",
+        'pluma_lbl_altura': "Tower Structure Height:",
+        'pluma_kpis_default': "Select an hour to evaluate the profile...",
+        'pluma_gb_control': "Time Navigation in the Simulated Period",
+        'pluma_fecha_default': "Date/Time: --/--/---- --:--",
+        'pluma_btn_worst': "📍 Go to Maximum Plume",
+        'pluma_torre_label': "Cooling Tower",
+        'pluma_visible_label': "Visible Plume (Saturation/Fog)",
+        'pluma_eje_central': "Central Axis",
+        'pluma_eje_dispersion': "Thermal Dispersion Axis",
+        'pluma_viento_inst': "Instant Wind: {u:.1f} m/s",
+        'pluma_xlabel': "Horizontal Distance in Wind Direction (m)",
+        'pluma_ylabel': "Height Above Ground (m)",
+        'pluma_titulo': "Time: {fecha} | v0={v0:.1f} m/s | T_out={tsal:.1f}°C | T_amb={tamb:.1f}°C",
+        'pluma_riesgo_critico': "CRITICAL (Wind overcomes fan draft)",
+        'pluma_riesgo_moderado': "MODERATE (Severe deflection)",
+        'pluma_riesgo_bajo': "LOW (Stable thermal buoyancy)",
+        'pluma_kpi_texto': "<b>Discharge Velocity (v0):</b> {v0:.1f} m/s | <b>Visible Plume Length:</b> {l:.1f} m | <b>Maximum Height:</b> {h:.1f} m | <b>Recirculation Risk:</b> {riesgo}",
+        'pluma_fecha_texto': "📅 {fecha}",
+
+        # --- EPW Dynamic Simulation Window ---
+        'sim_title': "Annual / Climatic Dynamic Simulation (.EPW) with PID and Water Balance",
+        'sim_gb_epw': "1. EPW Climate File",
+        'sim_epw_placeholder': "Select .epw file...",
+        'sim_btn_examinar': "Browse...",
+        'sim_gb_tiempo': "2. Time Range, Pond and Blowdown",
+        'sim_lbl_fecha_ini': "Start Date:",
+        'sim_lbl_fecha_fin': "End Date:",
+        'sim_lbl_dt': "Time Step Δt:",
+        'sim_lbl_vol_estanque': "Pond Volume:",
+        'sim_lbl_coc': "Cycles of Concentration (COC):",
+        'sim_lbl_drift': "Drift:",
+        'sim_gb_pid': "3. Fan PID Controller",
+        'sim_lbl_setpoint': "Water Temp. Setpoint:",
+        'sim_lbl_kp': "Gain Kp:",
+        'sim_lbl_ti': "Integral Time Ti:",
+        'sim_lbl_td': "Derivative Time Td:",
+        'sim_lbl_speed_min': "Minimum Speed:",
+        'sim_gb_motor': "4. Motor and Efficiency",
+        'sim_lbl_p_motor': "Motor Power:",
+        'sim_lbl_eta_fan': "Overall Efficiency:",
+        'sim_btn_ejecutar': "Simulate",
+        'sim_gb_kpi': "📊 Water Balance and Period KPIs",
+        'sim_kpi_q_disipada': "Dissipated Energy:",
+        'sim_kpi_kwh_total': "Consumed Energy:",
+        'sim_kpi_m3_evap': "Evaporated Water (E):",
+        'sim_kpi_m3_purga': "Blowdown Water (B):",
+        'sim_kpi_m3_drift': "Drift Water (D):",
+        'sim_kpi_m3_total': "Total Make-up:",
+        'sim_kpi_cop': "Performance (COP):",
+        'sim_kpi_int_agua': "Specific Water Consumption:",
+        'sim_gb_vars': "Variables to Plot",
+        'chk_tin': "Water Inlet Temp. Tw1 (°C)",
+        'chk_tout': "Water Outlet Temp. Tw2 (°C)",
+        'chk_speed': "Fan Speed (%)",
+        'chk_power': "Electrical Power (kW)",
+        'chk_twb': "Wet Bulb Twb (°C)",
+        'chk_tdb': "Ext. Dry Bulb Tdb (°C)",
+        'chk_taout': "Air Outlet Temp. Ta,out (°C)",
+        'chk_niebla': "Fog Presence (Shading)",
+        'chk_q': "Thermal Load (MWt)",
+        'chk_evap': "Evaporation (m³/h)",
+        'sim_dlg_examinar_title': "Select EPW Climate File",
+        'sim_dlg_examinar_filter': "EPW Files (*.epw);;All Files (*.*)",
+        'epw_multi_title': "EPW: Multiple Years Detected",
+        'epw_multi_info': "The EPW file contains rows from multiple source years. How would you like to treat the dates?",
+        'epw_multi_preserve': "Preserve original years (keep datetimes as-is)",
+        'epw_multi_normalize': "Normalize to a single year:",
+        'epw_multi_years_present': "Years present in file: {years}",
+        'epw_multi_remember': "Remember my choice",
+        'epw_choice_cleared_title': "EPW Preference Cleared",
+        'epw_choice_cleared_msg': "Saved preference for EPW files has been removed.",
+        'epw_choice_cleared_err': "Could not remove saved EPW preference.",
+        'sim_clear_epw_choice': "Clear saved EPW preference",
+        'menu_settings': "Settings",
+        'sim_reset_prefs': "Reset all preferences",
+        'reset_prefs_confirm_title': "Reset Preferences",
+        'reset_prefs_confirm_msg': "Reset all application preferences to their defaults?",
+        'reset_prefs_done_msg': "Preferences reset successfully.",
+        'reset_prefs_err_msg': "Could not reset preferences.",
+        'title_archivo_faltante': "Missing File",
+        'msg_archivo_faltante': "Please select a valid .epw file.",
+        'title_sim_pid': "Dynamic PID Simulation",
+        'sim_iniciando': "Starting time simulation...",
+        'msg_entrada_invalida_sim': "Please check the entered numeric parameters.",
+        'title_error_sim': "Simulation Error",
+        'msg_error_sim': "An error occurred:\n{err}",
+
+        # --- CSV Export ---
+        'sim_btn_csv': "💾 Export",
+        'sim_csv_dialog_title': "Save Results as CSV",
+        'sim_csv_filter': "CSV Files (*.csv)",
+        'title_sin_datos': "No Data",
+        'msg_sin_datos_csv': "You must run a simulation before exporting results.",
+        'msg_sin_variables_csv': "Select at least one variable to export.",
+        'title_csv_exportado': "Export Successful",
+        'msg_csv_exportado': "Results successfully exported to:\n{path}",
+        'title_error_csv': "Export Error",
+        'msg_error_csv': "Could not export the file:\n{err}",
+        'csv_col_fecha': "Date/Time",
+
+        # --- Dynamic Charts (replot) ---
+        'plot_niebla_activa': "Active Plume/Fog",
+        'plot_tin': "Water Inlet Temp. Tw1 (°C)",
+        'plot_tout': "Water Outlet Temp. Tw2 (°C)",
+        'plot_setpoint': "Water Setpoint",
+        'plot_saturation': "Saturation (ws)",
+        'plot_twb': "Wet Bulb Twb (°C)",
+        'plot_tdb': "Dry Bulb Tdb (°C)",
+        'plot_taout': "Air Outlet Temp. Ta,out (°C)",
+        'plot_ylabel_temp': "Temperature (°C)",
+        'plot_speed': "Fan Speed (%)",
+        'plot_ylabel_vel': "Speed (%)",
+        'plot_power': "Electrical Power (kW)",
+        'plot_ylabel_pow': "Power (kW)",
+        'plot_q': "Thermal Load (MWt)",
+        'plot_ylabel_carga': "Load (MWt)",
+        'plot_evap': "Evaporation (m³/h)",
+        'plot_ylabel_evap': "Evaporation (m³/h)",
+        'plot_xlabel_fecha': "Date / Time",
+
+        # --- 2D Map (MplCanvas) ---
+        'mapa2d_cbar_tw': "Water Temperature (°C)",
+        'plot_tdb': "Dry Bulb Tdb (°C)",
+        'plot_setpoint': "Setpoint",
+        'mapa2d_cbar_wa': "Humidity Ratio (g vapor / kg air)",
+        'mapa2d_cbar_ta': "Air Dry Bulb Temp. (°C)",
+        'mapa2d_zona_niebla': "Fog Zone",
+        'mapa2d_frente_condensacion': "Condensation Front",
+        'mapa2d_titulo': "2D Map ({n}x{n}): {capa}   (NTU = {ntu:.4f})  [{motor}]\nRoof Inlet: {tin:.1f} °C   |   Mixed Basin: {tsal:.2f} °C",
+        'mapa2d_xlabel': "Ambient Air Inlet   →   Air Flow Direction   →   Outlet",
+        'mapa2d_ylabel': "← Water Fall (Roof to Basin) →",
+        'accion_ver_psicrometrico': "View Psychrometric Chart...",
+        'tip_ver_psicrometrico': "Show simulation evolution in psychrometric chart with time slider",
+    },
+}
+
+# ==========================================
 # 9. VENTANA PRINCIPAL DE PyQt5 CON OPCIÓN DE PLUMA EN MENÚ
 # ==========================================
 class TorreCoolingApp(QMainWindow):
@@ -1300,7 +2438,8 @@ class TorreCoolingApp(QMainWindow):
         self.retranslate_ui()
 
     def tr_txt(self, key, **kwargs):
-        return traducir(self.idioma, key, **kwargs)
+        texto = TRANSLATIONS[self.idioma][key]
+        return texto.format(**kwargs) if kwargs else texto
 
     def cambiar_idioma(self, lang):
         if self.idioma == lang:
@@ -1350,7 +2489,7 @@ class TorreCoolingApp(QMainWindow):
         self.menu_idioma.addAction(self.action_idioma_es)
         self.menu_idioma.addAction(self.action_idioma_en)
         # SETTINGS MENU
-        self.menu_settings = menubar.addMenu(self.tr_txt('menu_settings'))
+        self.menu_settings = menubar.addMenu(self.tr_txt('menu_settings') if 'menu_settings' in TRANSLATIONS[self.idioma] else 'Settings')
         self.menu_settings.addAction(self.action_clear_epw_choice)
         # Reset all preferences action
         self.action_reset_prefs = QAction(self)
@@ -1364,11 +2503,11 @@ class TorreCoolingApp(QMainWindow):
         self.action_sim_dinamica.setToolTip(self.tr_txt('tip_sim_dinamica'))
         self.action_ver_pluma.setText(self.tr_txt('accion_ver_pluma'))
         self.action_ver_pluma.setToolTip(self.tr_txt('tip_ver_pluma'))
-        self.action_psicrometrico.setText(self.tr_txt('accion_ver_psicrometrico'))
-        self.action_psicrometrico.setToolTip(self.tr_txt('tip_ver_psicrometrico'))
-        self.action_clear_epw_choice.setText(self.tr_txt('sim_clear_epw_choice'))
+        self.action_psicrometrico.setText(self.tr_txt('accion_ver_psicrometrico') if 'accion_ver_psicrometrico' in TRANSLATIONS[self.idioma] else 'Psychrometric Chart...')
+        self.action_psicrometrico.setToolTip(self.tr_txt('tip_ver_psicrometrico') if 'tip_ver_psicrometrico' in TRANSLATIONS[self.idioma] else 'Show psychrometric chart for simulation with time slider')
+        self.action_clear_epw_choice.setText(self.tr_txt('sim_clear_epw_choice') if 'sim_clear_epw_choice' in TRANSLATIONS[self.idioma] else 'Clear saved EPW choice')
         # reset prefs menu item
-        self.action_reset_prefs.setText(self.tr_txt('sim_reset_prefs'))
+        self.action_reset_prefs.setText(self.tr_txt('sim_reset_prefs') if 'sim_reset_prefs' in TRANSLATIONS[self.idioma] else 'Reset all preferences')
 
     def _clear_saved_epw_choice(self):
         try:
