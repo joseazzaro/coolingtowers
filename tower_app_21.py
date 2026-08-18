@@ -396,7 +396,7 @@ class DialogoPsicrometrico(QDialog):
         super().__init__(parent)
         self.idioma = idioma
         self.datos_sim = datos_sim or {}
-        self.setWindowTitle(self.tr_txt('accion_ver_psicrometrico'))
+        self.setWindowTitle('Psychrometric Chart')
         self.resize(700, 520)
         self.init_ui()
 
@@ -460,19 +460,130 @@ class DialogoPsicrometrico(QDialog):
         if idx < len(T_a_out):
             ax.scatter([T_a_out[idx]], [w_a_out_g[idx]], color='#C0392B', s=60, zorder=10)
 
-        # X-axis limits: Fixed range 15–40°C for typical tower outlet conditions
+        # X-axis limits: Fixed range 15-40°C for typical tower outlet conditions
         ax.set_xlim(15.0, 40.0)
 
-        # Y-axis: ASHRAE-like fixed range 0–30 g/kg with ticks every 5 g/kg
-        ax.set_ylim(0.0, 30.0)
-        ax.set_yticks([0, 5, 10, 15, 20, 25, 30])
+        visible_sat = w_sat_g[(T_sat >= 15.0) & (T_sat <= 40.0)]
+        visible_outlet = w_a_out_g[np.isfinite(w_a_out_g)]
+        y_values = np.concatenate((visible_sat, visible_outlet))
+        y_values = y_values[np.isfinite(y_values)]
+        if y_values.size:
+            y_min = min(0.0, float(np.min(y_values)))
+            y_max = float(np.max(y_values))
+            y_margin = max(0.5, (y_max - y_min) * 0.08)
+            ax.set_ylim(y_min - y_margin, y_max + y_margin)
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.0f'))
 
         ax.set_xlabel('Tower Outlet Temperature (°C)')
         ax.set_ylabel('Humidity Ratio (g/kg)')
         ax.grid(True, linestyle=':', alpha=0.6)
-        ax.set_title(self.tr_txt('accion_ver_psicrometrico'))
+        ax.set_title('Psychrometric Chart')
         ax.legend(loc='upper right', fontsize=8)
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+
+class DialogoDuracionAcumulada(QDialog):
+    """Cumulative (load) duration curve: metrics sorted descending vs accumulated operating hours."""
+
+    def __init__(self, parent=None, datos_sim=None, idioma='es'):
+        super().__init__(parent)
+        self.idioma = idioma
+        self.datos_sim = datos_sim or {}
+        self.setWindowTitle(self.tr_txt('dur_title'))
+        self.resize(750, 550)
+        self.init_ui()
+
+    def tr_txt(self, key, **kwargs):
+        return traducir(self.idioma, key, **kwargs)
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.fig = Figure(figsize=(7.0, 5.0), dpi=100)
+        self.canvas = FigureCanvas(self.fig)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+
+        ctrl = QHBoxLayout()
+        self.chk_water = QCheckBox(self.tr_txt('dur_chk_water'))
+        self.chk_water.setChecked(True)
+        self.chk_power = QCheckBox(self.tr_txt('dur_chk_power'))
+        self.chk_power.setChecked(True)
+        self.chk_thermal = QCheckBox(self.tr_txt('dur_chk_thermal'))
+        self.chk_thermal.setChecked(False)
+
+        for chk in (self.chk_water, self.chk_power, self.chk_thermal):
+            chk.stateChanged.connect(self.replot)
+            ctrl.addWidget(chk)
+        ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        self.replot()
+
+    def _curva_duracion(self, values):
+        """Sort values descending and pair them with accumulated operating hours."""
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            return arr, arr
+        dt_h = float(self.datos_sim.get('dt_sim_sec', 3600.0)) / 3600.0
+        x_horas = np.arange(1, arr.size + 1) * dt_h
+        return x_horas, np.sort(arr)[::-1]
+
+    def replot(self):
+        self.fig.clear()
+
+        mostrar_agua = self.chk_water.isChecked()
+        mostrar_power = self.chk_power.isChecked()
+        mostrar_thermal = self.chk_thermal.isChecked()
+
+        if not (mostrar_agua or mostrar_power or mostrar_thermal):
+            self.canvas.draw()
+            return
+
+        ax = self.fig.add_subplot(111)
+        lines = []
+        eje_primario_usado = False
+        ejes_extra = []
+
+        if mostrar_agua:
+            x, y = self._curva_duracion(self.datos_sim.get('agua_total_m3h', []))
+            l, = ax.plot(x, y, color='#2980B9', label=self.tr_txt('dur_chk_water'), linewidth=1.4)
+            lines.append(l)
+            ax.set_ylabel(self.tr_txt('dur_ylabel_water'), color='#2980B9', fontsize=9)
+            ax.tick_params(axis='y', labelcolor='#2980B9')
+            eje_primario_usado = True
+
+        if mostrar_power:
+            x, y = self._curva_duracion(self.datos_sim.get('power_kw', []))
+            ax_power = ax if not eje_primario_usado else ax.twinx()
+            if ax_power is not ax:
+                ejes_extra.append(ax_power)
+            l, = ax_power.plot(x, y, color='#27AE60', label=self.tr_txt('dur_chk_power'), linewidth=1.4, linestyle='--')
+            lines.append(l)
+            ax_power.set_ylabel(self.tr_txt('dur_ylabel_power'), color='#27AE60', fontsize=9)
+            ax_power.tick_params(axis='y', labelcolor='#27AE60')
+            eje_primario_usado = True
+
+        if mostrar_thermal:
+            x, y = self._curva_duracion(self.datos_sim.get('q_mwt', []))
+            if not eje_primario_usado:
+                ax_thermal = ax
+            else:
+                ax_thermal = ax.twinx()
+                if ejes_extra:
+                    ax_thermal.spines['right'].set_position(('outward', 55))
+                ejes_extra.append(ax_thermal)
+            l, = ax_thermal.plot(x, y, color='#8E44AD', label=self.tr_txt('dur_chk_thermal'), linewidth=1.4, linestyle='-.')
+            lines.append(l)
+            ax_thermal.set_ylabel(self.tr_txt('dur_ylabel_thermal'), color='#8E44AD', fontsize=9)
+            ax_thermal.tick_params(axis='y', labelcolor='#8E44AD')
+
+        ax.set_xlabel(self.tr_txt('dur_xlabel'), fontsize=9)
+        ax.grid(True, linestyle=':', alpha=0.5)
+        labels = [l.get_label() for l in lines]
+        ax.legend(lines, labels, loc='upper right', fontsize=8, framealpha=0.85)
         self.fig.tight_layout()
         self.canvas.draw()
 
@@ -649,17 +760,19 @@ class VentanaSimulacionDinamica(QDialog):
         grid_pid.setColumnMinimumWidth(1, 95)
 
         self.txt_t_set = QLineEdit("20.6")
-        self.txt_kp = QLineEdit("4.0")
-        self.txt_ti = QLineEdit("300.0")
-        self.txt_td = QLineEdit("5.0")
+        self.txt_kp = QLineEdit("1.0")
+        self.txt_ti = QLineEdit("1800.0")
+        self.txt_td = QLineEdit("0.0")
         self.txt_speed_min = QLineEdit("20.0")
+        # --- NUEVOS CAMPOS: Banda Muerta y Rampa Máxima ---
+        self.txt_deadband = QLineEdit("0.3")
+        self.txt_max_rate = QLineEdit("5.0")
 
-        for txt in [self.txt_t_set, self.txt_kp, self.txt_ti, self.txt_td, self.txt_speed_min]:
+        for txt in [self.txt_t_set, self.txt_kp, self.txt_ti, self.txt_td, 
+                    self.txt_speed_min, self.txt_deadband, self.txt_max_rate]:
             txt.setFont(QFont("Segoe UI", 9))
             txt.setValidator(QDoubleValidator())
             txt.setFixedWidth(90)
-
-        for txt in [self.txt_t_set, self.txt_kp, self.txt_ti, self.txt_td, self.txt_speed_min]:
             conectar_formato_precision(txt, 1)
 
         grid_pid.addWidget(QLabel(self.tr_txt('sim_lbl_setpoint')), 0, 0)
@@ -680,6 +793,15 @@ class VentanaSimulacionDinamica(QDialog):
         grid_pid.addWidget(QLabel(self.tr_txt('sim_lbl_speed_min')), 4, 0)
         grid_pid.addWidget(self.txt_speed_min, 4, 1)
         grid_pid.addWidget(QLabel("%"), 4, 2)
+
+        # --- AGREGAR A LA GRILLA ---
+        grid_pid.addWidget(QLabel("Banda Muerta (Deadband):"), 5, 0)
+        grid_pid.addWidget(self.txt_deadband, 5, 1)
+        grid_pid.addWidget(QLabel("°C"), 5, 2)
+
+        grid_pid.addWidget(QLabel("Rampa Máx. (Max Rate):"), 6, 0)
+        grid_pid.addWidget(self.txt_max_rate, 6, 1)
+        grid_pid.addWidget(QLabel("%/paso"), 6, 2)
 
         for i in range(grid_pid.count()):
             w = grid_pid.itemAt(i).widget()
@@ -922,6 +1044,8 @@ class VentanaSimulacionDinamica(QDialog):
                 'ti': float(self.txt_ti.text()),
                 'td': float(self.txt_td.text()),
                 'speed_min': float(self.txt_speed_min.text()),
+                'deadband': float(self.txt_deadband.text()),
+                'max_rate': float(self.txt_max_rate.text()),
                 'p_motor_kw': float(self.txt_p_motor.text()),
                 'eta_fan_pct': float(self.txt_eta_fan.text()),
                 'caudal_w_m3h': self.datos_torre['caudal_w'],
@@ -994,8 +1118,12 @@ class VentanaSimulacionDinamica(QDialog):
             'ti': self.txt_ti.text(),
             'td': self.txt_td.text(),
             'speed_min': self.txt_speed_min.text(),
+            'deadband': self.txt_deadband.text(),
+            'max_rate': self.txt_max_rate.text(),
             'p_motor': self.txt_p_motor.text(),
             'eta_fan': self.txt_eta_fan.text(),
+            'epw_normalize': getattr(self, 'epw_normalize', False),
+            'epw_normalize_year': getattr(self, 'epw_normalize_year', None),
             'chk_tin': self.chk_tin.isChecked(),
             'chk_tout': self.chk_tout.isChecked(),
             'chk_speed': self.chk_speed.isChecked(),
@@ -1022,8 +1150,12 @@ class VentanaSimulacionDinamica(QDialog):
         self.txt_ti.setText(estado['ti'])
         self.txt_td.setText(estado['td'])
         self.txt_speed_min.setText(estado['speed_min'])
+        self.txt_deadband.setText(estado.get('deadband', '0.3'))
+        self.txt_max_rate.setText(estado.get('max_rate', '5.0'))
         self.txt_p_motor.setText(estado['p_motor'])
         self.txt_eta_fan.setText(estado['eta_fan'])
+        self.epw_normalize = estado.get('epw_normalize', False)
+        self.epw_normalize_year = estado.get('epw_normalize_year')
 
         self.chk_tin.setChecked(estado['chk_tin'])
         self.chk_tout.setChecked(estado['chk_tout'])
@@ -1329,6 +1461,12 @@ class TorreCoolingApp(QMainWindow):
         self.action_psicrometrico.triggered.connect(self.abrir_ventana_psicrometrico)
         self.menu_simulacion.addAction(self.action_psicrometrico)
 
+        # Cumulative duration curve action
+        self.action_duracion = QAction(self)
+        self.action_duracion.setEnabled(False)
+        self.action_duracion.triggered.connect(self.abrir_ventana_duracion)
+        self.menu_simulacion.addAction(self.action_duracion)
+
         # Action to clear saved EPW preference (placed under Settings menu)
         self.action_clear_epw_choice = QAction(self)
         self.action_clear_epw_choice.triggered.connect(self._clear_saved_epw_choice)
@@ -1366,6 +1504,8 @@ class TorreCoolingApp(QMainWindow):
         self.action_ver_pluma.setToolTip(self.tr_txt('tip_ver_pluma'))
         self.action_psicrometrico.setText(self.tr_txt('accion_ver_psicrometrico'))
         self.action_psicrometrico.setToolTip(self.tr_txt('tip_ver_psicrometrico'))
+        self.action_duracion.setText(self.tr_txt('accion_ver_duracion'))
+        self.action_duracion.setToolTip(self.tr_txt('tip_ver_duracion'))
         self.action_clear_epw_choice.setText(self.tr_txt('sim_clear_epw_choice'))
         # reset prefs menu item
         self.action_reset_prefs.setText(self.tr_txt('sim_reset_prefs'))
@@ -1743,6 +1883,7 @@ class TorreCoolingApp(QMainWindow):
         self.ultimo_resultado_dinamico = res_din
         self.action_ver_pluma.setEnabled(True)
         self.action_psicrometrico.setEnabled(True)
+        self.action_duracion.setEnabled(True)
 
     def abrir_ventana_pluma(self):
         if self.ultimo_resultado_dinamico is None:
@@ -1757,6 +1898,13 @@ class TorreCoolingApp(QMainWindow):
             QMessageBox.warning(self, self.tr_txt('title_simulacion_requerida'), self.tr_txt('msg_simulacion_requerida'))
             return
         dlg = DialogoPsicrometrico(self, datos_sim=self.ultimo_resultado_dinamico, idioma=self.idioma)
+        dlg.exec_()
+
+    def abrir_ventana_duracion(self):
+        if self.ultimo_resultado_dinamico is None:
+            QMessageBox.warning(self, self.tr_txt('title_simulacion_requerida'), self.tr_txt('msg_simulacion_requerida'))
+            return
+        dlg = DialogoDuracionAcumulada(self, datos_sim=self.ultimo_resultado_dinamico, idioma=self.idioma)
         dlg.exec_()
 
 # ==========================================

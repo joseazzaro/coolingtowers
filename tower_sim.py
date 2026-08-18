@@ -19,74 +19,68 @@ from utils import leer_archivo_epw
 # PID CONTROLLER
 # ==========================================
 class ControladorPID:
-    """PID controller for fan speed regulation.
-    
-    Uses proportional, integral, and derivative terms to control output (0-100%).
-    """
-    
-    def __init__(self, Kp=4.0, Ti=300.0, Td=5.0, u_min=0.0, u_max=100.0):
-        """Initialize PID controller.
-        
-        Args:
-            Kp: Proportional gain (default: 4.0)
-            Ti: Integral time constant in seconds (default: 300.0)
-            Td: Derivative time constant in seconds (default: 5.0)
-            u_min: Output minimum (default: 0.0)
-            u_max: Output maximum (default: 100.0)
-        """
+    def __init__(self, Kp=1.0, Ti=1800.0, Td=0.0, u_min=20.0, u_max=100.0, deadband=0.3, max_rate=5.0):
         self.Kp = float(Kp)
         self.Ti = max(float(Ti), 1.0)
         self.Td = float(Td)
         self.u_min = float(u_min)
         self.u_max = float(u_max)
+        self.deadband = max(0.0, float(deadband))
+        self.max_rate = float(max_rate)  # Máximo cambio de % por paso
         self.integral = 0.0
         self.prev_error = None
+        self.prev_u = None
 
     def calcular(self, setpoint, medido, dt):
-        """Calculate PID output.
-        
-        Args:
-            setpoint: Target value
-            medido: Measured value
-            dt: Time step in seconds
-            
-        Returns:
-            Saturated output (u_min to u_max)
-        """
-        error = float(medido - setpoint)
-        if np.isnan(error) or np.isinf(error):
-            error = 0.0
+        error_real = float(medido - setpoint)
+        if np.isnan(error_real) or np.isinf(error_real):
+            error_real = 0.0
+
+        # 1. APLICAR BANDA MUERTA (Deadband)
+        # Si el error está dentro del rango neutro, se anula la acción del PID
+        if abs(error_real) <= self.deadband:
+            error_calc = 0.0
+        else:
+            error_calc = error_real
 
         if self.prev_error is None:
-            self.prev_error = error
+            self.prev_error = error_real
 
-        # Proportional term
-        P = self.Kp * error
-        
-        # Integral term with anti-windup
-        self.integral += error * dt
-        if np.isnan(self.integral) or np.isinf(self.integral):
-            self.integral = 0.0
-        I = (self.Kp / self.Ti) * self.integral
-        
-        # Derivative term
-        D = self.Kp * self.Td * (error - self.prev_error) / dt if dt > 0 else 0.0
-        self.prev_error = error
-        
-        # Unsaturated output
-        u_raw = P + I + D
-        if np.isnan(u_raw) or np.isinf(u_raw):
-            u_raw = self.u_min
+        # Términos Proporcional y Derivativo
+        P = self.Kp * error_calc
+        D = self.Kp * self.Td * (error_real - self.prev_error) / dt if dt > 0 else 0.0
 
-        # Saturate
-        u_sat = max(self.u_min, min(self.u_max, u_raw))
-        
-        # Anti-windup: if saturated, reduce integral accumulation
-        if u_raw != u_sat:
-            self.integral -= error * dt
+        # 2. EVALUACIÓN DE ANTI-WINDUP (Conditional Clamping)
+        # Salida tentativa previa para verificar si el actuador ya se saturó
+        u_raw_previo = P + (self.Kp / self.Ti) * self.integral + D
+        u_sat_previo = max(self.u_min, min(self.u_max, u_raw_previo))
+
+        esta_saturado = (u_raw_previo != u_sat_previo)
+        mismo_signo = (error_calc * u_raw_previo) > 0
+
+        # Congela la integración si está saturado empujando en la misma dirección.
+        # Permite integrar si el error ayuda a desaturar el sistema.
+        if not (esta_saturado and mismo_signo):
+            self.integral += error_calc * dt
             if np.isnan(self.integral) or np.isinf(self.integral):
                 self.integral = 0.0
-            
+
+        # Término Integral definitivo
+        I = (self.Kp / self.Ti) * self.integral
+
+        # 3. SATURACIÓN DE LÍMITES OPERATIVOS (u_min / u_max)
+        u_unsat = P + I + D
+        u_sat = max(self.u_min, min(self.u_max, u_unsat))
+
+        # 4. LIMITADOR DE RAMPA (Max Rate / Slew Rate Limiter)
+        # Restringe la aceleración/desaceleración abrupta por paso de tiempo
+        if self.prev_u is not None and self.max_rate > 0:
+            delta_u = u_sat - self.prev_u
+            if abs(delta_u) > self.max_rate:
+                u_sat = self.prev_u + np.sign(delta_u) * self.max_rate
+
+        self.prev_error = error_real
+        self.prev_u = u_sat
         return u_sat
 
 # ==========================================
@@ -209,13 +203,6 @@ class CalibracionWorker(QThread if HAS_PYQT5 else object):
                 self.error_signal.emit(str(e))
 
 class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
-    """Dynamic simulation worker - Simulates tower over climate profile with time steps.
-    
-    Reads EPW climate file, runs transient simulation with PID control,
-    tracks evaporation, drift, and fog formation over simulation period.
-    Inherits from QThread for PyQt5 compatibility.
-    """
-    
     if HAS_PYQT5:
         progreso_signal = pyqtSignal(str, int)
         exito_signal = pyqtSignal(dict)
@@ -223,21 +210,14 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
         cancelado_signal = pyqtSignal()
 
     def __init__(self, config_sim):
-        """Initialize dynamic simulation worker.
-        
-        Args:
-            config_sim: Dictionary with simulation configuration
-        """
         super().__init__()
         self.cfg = config_sim
         self._is_cancelled = False
 
     def cancelar(self):
-        """Request cancellation."""
         self._is_cancelled = True
 
     def run(self):
-        """Execute dynamic simulation (called by QThread.start())."""
         try:
             if HAS_PYQT5:
                 self.progreso_signal.emit("Cargando y procesando archivo climático EPW...", 5)
@@ -246,27 +226,16 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             if not clima:
                 raise ValueError("No se pudieron extraer datos válidos del archivo EPW.")
 
-            # Normalize to a single canonical year if requested
             if self.cfg.get('epw_normalize'):
                 target_year = int(self.cfg.get('epw_normalize_year') or 2000)
                 clima_norm = []
                 for r in clima:
                     dt0 = r['dt']
-                    m = dt0.month
-                    d = dt0.day
-                    h = dt0.hour
+                    m, d, h = dt0.month, dt0.day, dt0.hour
                     try:
                         ndt = datetime(target_year, m, d, h)
                     except ValueError:
-                        ndt = None
-                        for dd in (28, 27, 26, 25):
-                            try:
-                                ndt = datetime(target_year, m, dd, h)
-                                break
-                            except Exception:
-                                ndt = None
-                        if ndt is None:
-                            ndt = datetime(target_year, m, max(1, min(28, d)), h)
+                        ndt = datetime(target_year, m, max(1, min(28, d)), h)
                     nr = dict(r)
                     nr['dt'] = ndt
                     clima_norm.append(nr)
@@ -291,15 +260,11 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             time_steps_sec = np.arange(0, t_total_sec + dt_sim_sec, dt_sim_sec)
             total_pasos = len(time_steps_sec)
 
-            if HAS_PYQT5:
-                self.progreso_signal.emit("Pre-interpolando vectores climáticos con NumPy...", 7)
             tdb_vec = np.interp(time_steps_sec, t_epw_sec, tdb_epw)
             twb_vec = np.interp(time_steps_sec, t_epw_sec, twb_epw)
             patm_vec = np.interp(time_steps_sec, t_epw_sec, patm_epw)
             uviento_vec = np.interp(time_steps_sec, t_epw_sec, uviento_epw)
 
-            if HAS_PYQT5:
-                self.progreso_signal.emit("Inicializando Tabla Psicrométrica Fast-LUT...", 9)
             lut = PsicroLUT(T_min=-15.0, T_max=65.0, step=0.1, P_atm=patm_epw[0])
 
             w_sat_wb_vec = np.array([lut.get_ws_hs(twb_vec[k])[0] for k in range(total_pasos)])
@@ -308,7 +273,9 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
 
             pid = ControladorPID(
                 Kp=self.cfg['kp'], Ti=self.cfg['ti'], Td=self.cfg['td'],
-                u_min=self.cfg['speed_min'], u_max=100.0
+                u_min=self.cfg['speed_min'], u_max=100.0,
+                deadband=self.cfg.get('deadband', 0.3),
+                max_rate=self.cfg.get('max_rate', 5.0)
             )
 
             caudal_w_m3h = self.cfg['caudal_w_m3h']
@@ -324,33 +291,49 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             m_estanque_kg = max(100.0, v_estanque_m3 * 1000.0)
             tau_sec = m_estanque_kg / m_w_nom
 
-            delta_T_proceso = self.cfg['t_w_in_nom'] - T_set
+            # CAMBIO 1: Amortiguamiento dinámico de la piscina (máximo 15% de renovación por paso)
+            fraccion_renovacion = min(0.15, dt_sim_sec / tau_sec)
+
+            # CAMBIO 2: Delta constante del proceso térmico industrial
+            delta_T_proceso = float(self.cfg['t_w_in_nom']) - T_set
 
             p_motor_nom_kw = self.cfg['p_motor_kw']
             eta_glob = max(0.1, min(1.0, self.cfg['eta_fan_pct'] / 100.0))
 
-            T_piscina = T_set + 0.2
-            T_w_in_dinamica = T_piscina + delta_T_proceso
-
+            # ==========================================
+            # WARM-UP ACOPLADO DE INERCIA
+            # ==========================================
             tdb_0 = tdb_vec[0]
             twb_0 = twb_vec[0]
             patm_0 = patm_vec[0]
             w_a_in0 = w_a_in_vec[0]
             h_a_in0 = h_a_in_vec[0]
 
-            for _ in range(20):
+            T_piscina = max(twb_0 + 1.5, T_set)
+            T_w_in_dinamica = T_piscina + delta_T_proceso
+
+            pid.integral = 0.0
+            pid.prev_error = T_piscina - T_set
+            pid.prev_u = pid.u_min
+
+            for _ in range(40):
                 u_init = pid.calcular(T_set, T_piscina, dt_sim_sec)
-                m_a_init = max(1e-4, m_a_nom * (u_init / 100.0))
+                # Piso de aire del 5% del nominal durante warm-up
+                m_a_init = max(0.05 * m_a_nom, m_a_nom * (u_init / 100.0))
+
                 T_sal_init, _, _, _, _, _ = simular_torre_2d_matriz(
-                    NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, Nx=6, Ny=6, lut=lut
+                    NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
+                    Nx=6, Ny=6, lut=lut
                 )
                 T_sal_init = max(twb_0, min(T_w_in_dinamica, T_sal_init))
-                T_piscina = T_piscina + min(1.0, dt_sim_sec / tau_sec) * (T_sal_init - T_piscina)
+                T_piscina = T_piscina + fraccion_renovacion * (T_sal_init - T_piscina)
                 T_w_in_dinamica = T_piscina + delta_T_proceso
 
+            pid.prev_error = T_piscina - T_set
+            pid.prev_u = u_init
+
             times, t_out_arr, t_in_arr, fan_speed_arr, t_wb_arr, t_db_arr, t_a_out_arr, evap_arr, q_mwt_arr, niebla_arr = [], [], [], [], [], [], [], [], [], []
-            w_a_out_arr = []
-            power_kw_arr = []
+            w_a_out_arr, power_kw_arr, agua_total_arr = [], [], []
 
             energia_acum_kwh = 0.0
             energia_disipada_mwh_t = 0.0
@@ -358,21 +341,16 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             agua_drift_total_m3 = 0.0
             agua_purga_total_m3 = 0.0
 
-            fraccion_renovacion = min(1.0, dt_sim_sec / tau_sec)
             drift_m3h = caudal_w_m3h * (pct_drift / 100.0)
 
+            # ==========================================
+            # BUCLE PRINCIPAL
+            # ==========================================
             for idx in range(total_pasos):
                 if self._is_cancelled:
                     if HAS_PYQT5:
                         self.cancelado_signal.emit()
                     return
-
-                if idx % max(1, total_pasos // 50) == 0:
-                    pct = int(10 + (idx / total_pasos) * 85)
-                    sec = time_steps_sec[idx]
-                    dt_actual = clima_filtrado[0]['dt'] + timedelta(seconds=float(sec))
-                    if HAS_PYQT5:
-                        self.progreso_signal.emit(f"Simulando {dt_actual.strftime('%d/%m %H:%M')}...", pct)
 
                 tdb_k = tdb_vec[idx]
                 twb_k = twb_vec[idx]
@@ -381,7 +359,9 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 h_a_in_k = h_a_in_vec[idx]
 
                 velocidad_pct = pid.calcular(T_set, T_piscina, dt_sim_sec)
-                m_a_actual = max(1e-4, m_a_nom * (velocidad_pct / 100.0))
+                
+                # CAMBIO 3: Piso seguro para el flujo de aire (evita m_a = 0)
+                m_a_actual = max(0.05 * m_a_nom, m_a_nom * (velocidad_pct / 100.0))
 
                 u_ratio = velocidad_pct / 100.0
                 p_elec_instantanea_kw = (p_motor_nom_kw / eta_glob) * (u_ratio ** 3)
@@ -397,6 +377,7 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 w_a_out_prom = np.mean(Matriz_w_a[:, -1])
                 hay_niebla_paso = bool(np.any(Matriz_niebla))
 
+                # Actualización de la piscina con inercia y límites físicos de seguridad
                 T_piscina = T_piscina + fraccion_renovacion * (T_salida_inst - T_piscina)
                 T_piscina = max(twb_k, min(T_w_in_dinamica, T_piscina))
 
@@ -426,6 +407,7 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 q_mwt_arr.append(Q_MWt)
                 niebla_arr.append(hay_niebla_paso)
                 power_kw_arr.append(p_elec_instantanea_kw)
+                agua_total_arr.append(evap_m3h + drift_m3h + purga_m3h)
 
             agua_total_makeup_m3 = agua_evap_total_m3 + agua_drift_total_m3 + agua_purga_total_m3
             energia_disipada_kwh_t = energia_disipada_mwh_t * 1000.0
@@ -449,6 +431,8 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 'q_mwt': q_mwt_arr,
                 'niebla': niebla_arr,
                 'power_kw': power_kw_arr,
+                'agua_total_m3h': agua_total_arr,
+                'dt_sim_sec': dt_sim_sec,
                 'u_viento_vec': uviento_vec,
                 'energia_total_kwh': energia_acum_kwh,
                 'energia_disipada_mwh_t': energia_disipada_mwh_t,

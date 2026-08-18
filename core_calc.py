@@ -320,10 +320,17 @@ def simular_torre_2d_matriz(NTU_actual, T_w_in, m_w_total, h_a_in, w_a_in, m_a_t
             m_w_next = max(1e-6, m_water_cell - agua_evap_celda)
             m_w[i+1, j] = m_w_next
             
+            # CÓDIGO CORREGIDO CON SATURACIÓN FÍSICA:
             den_energia = m_w_next * cp_w_local
             if abs(den_energia) < 1e-6:
                 den_energia = 1e-6
-            T_w[i+1, j] = (m_water_cell * cp_w_local * T_water_cell - calor_transferido) / den_energia
+            
+            T_w_calculada = (m_water_cell * cp_w_local * T_water_cell - calor_transferido) / den_energia
+
+            # PROTECCIÓN FÍSICA OBLIGATORIA:
+            # El agua dentro del relleno nunca puede calentarse por encima de la temperatura 
+            # de entrada de la torre (T_w_in) ni enfriarse por debajo del límite de congelación/bulbo húmedo.
+            T_w[i+1, j] = max(-10.0, min(T_w_in, T_w_calculada))
 
     # Calculate outlet conditions
     T_w_salida_final = np.average(T_w[Ny, :], weights=m_w[Ny, :])
