@@ -41,25 +41,10 @@ def conectar_formato_precision(txt_widget, precision=1):
 # ==========================================
 # EPW FILE PARSING
 # ==========================================
-def leer_archivo_epw(path_epw):
-    """Parse EPW (EnergyPlus Weather) file robustly.
+def leer_archivo_epw(path_epw, año_referencia=2021):
+    """Parsea el archivo EPW asignando un año continuo de referencia (estilo EnergyPlus).
     
-    Detects data rows by checking if the first four columns are plausible
-    year/month/day/hour values (rather than relying on a fixed header size).
-    Estimates wet-bulb temperature from dry-bulb and relative humidity when
-    no direct wet-bulb column is present.
-    
-    Args:
-        path_epw: Path to EPW file
-        
-    Returns:
-        List of dictionaries with hourly climate data, or None on failure:
-        - dt: datetime object
-        - tdb: Dry-bulb temperature (°C)
-        - twb: Wet-bulb temperature (°C)
-        - rh: Relative humidity (0-1 fraction)
-        - patm: Atmospheric pressure (Pa)
-        - u_viento: Wind speed (m/s)
+    Ignora la columna del año del EPW para evitar discontinuidades en archivos TMYx.
     """
     datos_clima = []
 
@@ -87,26 +72,30 @@ def leer_archivo_epw(path_epw):
                 except Exception:
                     row0 = str(row[0]).strip()
 
-                anio = _safe_int(row0)
+                anio_raw = _safe_int(row0)
                 mes = _safe_int(row[1])
                 dia = _safe_int(row[2])
                 hora = _safe_int(row[3])
 
-                # Only accept rows that look like data (plausible ranges)
-                if anio is None or mes is None or dia is None or hora is None:
+                # Validar que sea una fila con formato de datos
+                if anio_raw is None or mes is None or dia is None or hora is None:
                     continue
-                if not (1900 <= anio <= 2100 and 1 <= mes <= 12 and 1 <= dia <= 31 and 1 <= hora <= 24):
+                if not (1 <= mes <= 12 and 1 <= dia <= 31 and 1 <= hora <= 24):
                     continue
 
-                # EPW hour is 1..24, convert to 0..23
+                # La hora en EPW es 1..24, convertimos a 0..23
                 hora_idx = max(0, min(23, hora - 1))
 
+                # Construir datetime con el año de referencia continuo
                 try:
-                    dt = datetime(anio, mes, dia, hora_idx)
-                except Exception:
-                    continue
+                    dt = datetime(año_referencia, mes, dia, hora_idx)
+                except ValueError:
+                    # En caso de 29 de febrero en año no bisiesto
+                    if mes == 2 and dia == 29:
+                        dt = datetime(año_referencia, 2, 28, hora_idx)
+                    else:
+                        continue
 
-                # Typical EPW columns (use reasonable defaults if missing)
                 tdb = _safe_float(row[6], None) if len(row) > 6 else None
                 rh_raw = _safe_float(row[8], None) if len(row) > 8 else None
                 patm = _safe_float(row[9], None) if len(row) > 9 else None
@@ -114,14 +103,11 @@ def leer_archivo_epw(path_epw):
                 if tdb is None or rh_raw is None:
                     continue
 
-                # RH in EPW is a percentage (0..100)
                 rh = rh_raw / 100.0
-
                 u_viento = _safe_float(row[21], None) if len(row) > 21 else None
                 if u_viento is None:
                     u_viento = _safe_float(row[20], 3.5) if len(row) > 20 else 3.5
 
-                # Fast wet-bulb approximation from dry-bulb and RH
                 try:
                     twb = (float(tdb) * np.arctan(0.151977 * (rh * 100.0 + 8.313659) ** 0.5)
                            + np.arctan(float(tdb) + rh * 100.0) - np.arctan(rh * 100.0 - 1.676331)
@@ -137,8 +123,6 @@ def leer_archivo_epw(path_epw):
                     'patm': float(patm) if patm is not None else 101325.0,
                     'u_viento': float(u_viento)
                 })
-    except FileNotFoundError:
-        return None
     except Exception:
         return None
 
@@ -208,7 +192,10 @@ def normalizar_epw_a_año_canonico(datos_clima, año_canonico=2017):
 # ==========================================
 TRADUCCIONES = {
     'es': {
-        'title': "CTSim - Gemelo Digital 2D - Torre de Enfriamiento (Poppe)",
+        'title': "CTSim - Gemelo Digital - Torre de Enfriamiento (Poppe)",
+        'menu_equipo': "Equipo",
+        'equipo_crossflow': "Torre Flujo Cruzado (Crossflow)",
+        'equipo_counterflow': "Torre Contraflujo (Counterflow)",
         'menu_simulacion': "Simulación",
         'menu_idioma': "Idioma",
         'idioma_es': "Español",
@@ -231,7 +218,8 @@ TRADUCCIONES = {
         'lbl_num_celdas': "Resolución Malla (NxN):",
         'btn_calcular': "Calibrar NTU",
         'btn_dos_puntos': "Ajuste 2 Puntos",
-        'lbl_combo': "Variable a Visualizar en la Matriz 2D:",
+        'lbl_combo_crossflow': "Variable a Visualizar en la Matriz 2D:",
+        'lbl_combo_counterflow': "Variable a Visualizar en el Perfil 1D Vertical:",
         'combo_tw': "Temperatura del Agua (Tw)",
         'combo_wa': "Humedad Absoluta del Aire (wa)",
         'combo_ta': "Temperatura del Aire (Ta)",
@@ -392,15 +380,19 @@ TRADUCCIONES = {
         'plot_ylabel_evap': "Evaporación (m³/h)",
         'plot_xlabel_fecha': "Fecha / Hora",
 
-        # --- Mapa 2D (MplCanvas) ---
+        # --- Mapa / Perfil Térmico (MplCanvas) ---
         'mapa2d_cbar_tw': "Temperatura del Agua (°C)",
         'mapa2d_cbar_wa': "Humedad Absoluta (g vapor / kg aire)",
         'mapa2d_cbar_ta': "Temp. Bulbo Seco Aire (°C)",
         'mapa2d_zona_niebla': "Zona de Niebla",
         'mapa2d_frente_condensacion': "Frente de Condensación",
-        'mapa2d_titulo': "Mapa 2D ({n}x{n}): {capa}   (NTU = {ntu:.4f})  [{motor}]\nEntrada Techo: {tin:.1f} °C   |   Piscina Mezclada: {tsal:.2f} °C",
-        'mapa2d_xlabel': "Entrada Aire Ambiente   →   Dirección del Flujo de Aire   →   Salida",
-        'mapa2d_ylabel': "← Caída del Agua (Techo a Piscina) →",
+        'mapa_titulo_crossflow': "Mapa 2D ({n}x{n}): {capa} | Flujo Cruzado (Crossflow) (NTU = {ntu:.4f}) [{motor}]\nEntrada Techo: {tin:.1f} °C   |   Piscina Mezclada: {tsal:.2f} °C",
+        'mapa_titulo_counterflow': "Perfil 1D Vertical ({n} nodos): {capa} | Contraflujo (Counterflow) (NTU = {ntu:.4f}) [{motor}]\nEntrada Techo: {tin:.1f} °C   |   Piscina Mezclada: {tsal:.2f} °C",
+        'mapa_xlabel_crossflow': "Entrada Aire Ambiente   →   Dirección del Flujo de Aire   →   Salida",
+        'mapa_xlabel_counterflow': "← Sección Transversal Homogénea (Distribución Uniforme) →",
+        'mapa_ylabel_crossflow': "← Caída del Agua (Techo a Piscina) →",
+        'mapa_ylabel_counterflow': "Techo (Entrada Agua / Salida Aire)   ↓   Piscina (Salida Agua / Entrada Aire)",
+        
         'accion_ver_psicrometrico': "Ver Carta Psicrométrica...",
         'tip_ver_psicrometrico': "Mostrar la evolución en la carta psicrométrica con control por tiempo",
         'accion_ver_duracion': "Ver Curva de Duración Acumulada...",
@@ -415,7 +407,10 @@ TRADUCCIONES = {
         'dur_ylabel_thermal': "Carga Térmica (MWt)",
     },
     'en': {
-        'title': "CTSim - 2D Digital Twin - Cooling Tower (Poppe)",
+        'title': "CTSim - Digital Twin - Cooling Tower (Poppe)",
+        'menu_equipo': "Equipment",
+        'equipo_crossflow': "Crossflow Tower",
+        'equipo_counterflow': "Counterflow Tower",
         'menu_simulacion': "Simulation",
         'menu_idioma': "Language",
         'idioma_es': "Español",
@@ -438,7 +433,8 @@ TRADUCCIONES = {
         'lbl_num_celdas': "Grid Resolution (NxN):",
         'btn_calcular': "Calibrate NTU",
         'btn_dos_puntos': "2-Point Fit",
-        'lbl_combo': "Variable to Display in 2D Grid:",
+        'lbl_combo_crossflow': "Variable to Display in 2D Grid:",
+        'lbl_combo_counterflow': "Variable to Display in 1D Vertical Profile:",
         'combo_tw': "Water Temperature (Tw)",
         'combo_wa': "Air Humidity Ratio (wa)",
         'combo_ta': "Air Temperature (Ta)",
@@ -599,17 +595,19 @@ TRADUCCIONES = {
         'plot_ylabel_evap': "Evaporation (m³/h)",
         'plot_xlabel_fecha': "Date / Time",
 
-        # --- 2D Map (MplCanvas) ---
+        # --- Thermal Map / Profile (MplCanvas) ---
         'mapa2d_cbar_tw': "Water Temperature (°C)",
-        'plot_tdb': "Dry Bulb Tdb (°C)",
-        'plot_setpoint': "Setpoint",
         'mapa2d_cbar_wa': "Humidity Ratio (g vapor / kg air)",
         'mapa2d_cbar_ta': "Air Dry Bulb Temp. (°C)",
         'mapa2d_zona_niebla': "Fog Zone",
         'mapa2d_frente_condensacion': "Condensation Front",
-        'mapa2d_titulo': "2D Map ({n}x{n}): {capa}   (NTU = {ntu:.4f})  [{motor}]\nRoof Inlet: {tin:.1f} °C   |   Mixed Basin: {tsal:.2f} °C",
-        'mapa2d_xlabel': "Ambient Air Inlet   →   Air Flow Direction   →   Outlet",
-        'mapa2d_ylabel': "← Water Fall (Roof to Basin) →",
+        'mapa_titulo_crossflow': "2D Grid ({n}x{n}): {capa} | Crossflow (NTU = {ntu:.4f}) [{motor}]\nRoof Inlet: {tin:.1f} °C   |   Mixed Basin: {tsal:.2f} °C",
+        'mapa_titulo_counterflow': "1D Vertical Profile ({n} nodes): {capa} | Counterflow (NTU = {ntu:.4f}) [{motor}]\nRoof Inlet: {tin:.1f} °C   |   Mixed Basin: {tsal:.2f} °C",
+        'mapa_xlabel_crossflow': "Ambient Air Inlet   →   Air Flow Direction   →   Outlet",
+        'mapa_xlabel_counterflow': "← Homogeneous Cross Section (Uniform Distribution) →",
+        'mapa_ylabel_crossflow': "← Water Fall (Roof to Basin) →",
+        'mapa_ylabel_counterflow': "Roof (Water In / Air Out)   ↓   Basin (Water Out / Air In)",
+        
         'accion_ver_psicrometrico': "View Psychrometric Chart...",
         'tip_ver_psicrometrico': "Show simulation evolution in psychrometric chart with time slider",
         'accion_ver_duracion': "View Cumulative Duration Curve...",

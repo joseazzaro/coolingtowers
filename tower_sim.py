@@ -1,18 +1,15 @@
 """
 Tower simulation engines - Business logic for calibration and dynamic simulation.
-
-NOTE: These classes initially inherit from QThread for compatibility with tower_app_21.py.
-For web/mobile platforms, extract the run() method logic into pure functions.
+Platform-agnostic simulation workers compatible with PyQt5 threads.
 """
 
 import numpy as np
 from datetime import datetime, timedelta
 from psychro_data import PsicroLUT
 from utils import leer_archivo_epw
-# --- AGREGAR 'simular_torre_counterflow_1d' EN LA IMPORTACIÓN ---
 from core_calc import (
     simular_torre_2d_matriz,
-    simular_torre_counterflow_1d,  # <-- ¡AQUÍ ESTÁ LA LÍNEA QUE FALTA!
+    simular_torre_counterflow_1d,
     resolver_punto_operacion,
     obtener_presion_barometrica,
     humedad_saturacion,
@@ -22,7 +19,7 @@ from core_calc import (
 
 
 # ==========================================
-# PID CONTROLLER
+# CONTROLADOR PID (ACCIÓN DIRECTA - REFRIGERACIÓN)
 # ==========================================
 class ControladorPID:
     def __init__(self, Kp=1.0, Ti=1800.0, Td=0.0, u_min=20.0, u_max=100.0, deadband=0.3, max_rate=5.0):
@@ -32,18 +29,21 @@ class ControladorPID:
         self.u_min = float(u_min)
         self.u_max = float(u_max)
         self.deadband = max(0.0, float(deadband))
-        self.max_rate = float(max_rate)  # Máximo cambio de % por paso
+        self.max_rate = float(max_rate)  # % máx de cambio por paso
         self.integral = 0.0
         self.prev_error = None
         self.prev_u = None
+
+    def reset(self, u_inicial=20.0):
+        self.integral = 0.0
+        self.prev_error = None
+        self.prev_u = float(u_inicial)
 
     def calcular(self, setpoint, medido, dt):
         error_real = float(medido - setpoint)
         if np.isnan(error_real) or np.isinf(error_real):
             error_real = 0.0
 
-        # 1. APLICAR BANDA MUERTA (Deadband)
-        # Si el error está dentro del rango neutro, se anula la acción del PID
         if abs(error_real) <= self.deadband:
             error_calc = 0.0
         else:
@@ -52,34 +52,26 @@ class ControladorPID:
         if self.prev_error is None:
             self.prev_error = error_real
 
-        # Términos Proporcional y Derivativo
         P = self.Kp * error_calc
         D = self.Kp * self.Td * (error_real - self.prev_error) / dt if dt > 0 else 0.0
 
-        # 2. EVALUACIÓN DE ANTI-WINDUP (Conditional Clamping)
-        # Salida tentativa previa para verificar si el actuador ya se saturó
-        u_raw_previo = P + (self.Kp / self.Ti) * self.integral + D
-        u_sat_previo = max(self.u_min, min(self.u_max, u_raw_previo))
+        # Anti-Windup con Clamping Condicional
+        u_tentativo = P + (self.Kp / self.Ti) * self.integral + D
+        
+        bloquear_integral = False
+        if u_tentativo >= self.u_max and error_calc > 0:
+            bloquear_integral = True
+        elif u_tentativo <= self.u_min and error_calc < 0:
+            bloquear_integral = True
 
-        esta_saturado = (u_raw_previo != u_sat_previo)
-        mismo_signo = (error_calc * u_raw_previo) > 0
-
-        # Congela la integración si está saturado empujando en la misma dirección.
-        # Permite integrar si el error ayuda a desaturar el sistema.
-        if not (esta_saturado and mismo_signo):
+        if not bloquear_integral:
             self.integral += error_calc * dt
-            if np.isnan(self.integral) or np.isinf(self.integral):
-                self.integral = 0.0
 
-        # Término Integral definitivo
         I = (self.Kp / self.Ti) * self.integral
-
-        # 3. SATURACIÓN DE LÍMITES OPERATIVOS (u_min / u_max)
         u_unsat = P + I + D
         u_sat = max(self.u_min, min(self.u_max, u_unsat))
 
-        # 4. LIMITADOR DE RAMPA (Max Rate / Slew Rate Limiter)
-        # Restringe la aceleración/desaceleración abrupta por paso de tiempo
+        # Limitador de rampa
         if self.prev_u is not None and self.max_rate > 0:
             delta_u = u_sat - self.prev_u
             if abs(delta_u) > self.max_rate:
@@ -89,85 +81,67 @@ class ControladorPID:
         self.prev_u = u_sat
         return u_sat
 
-# ==========================================
-# SIMULATION ENGINES (with QThread for PyQt5 compatibility)
-# ==========================================
 
+# ==========================================
+# WORKERS DE CÁLCULO
+# ==========================================
 try:
     from PyQt5.QtCore import QThread, pyqtSignal
     HAS_PYQT5 = True
 except ImportError:
     HAS_PYQT5 = False
-    # Fallback: Create dummy QThread class for non-PyQt environments
     class QThread:
-        def __init__(self):
-            pass
-        def run(self):
-            pass
+        def __init__(self): pass
+        def run(self): pass
     class pyqtSignal:
-        def __init__(self, *args):
-            pass
-        def emit(self, *args):
-            pass
+        def __init__(self, *args): pass
+        def emit(self, *args): pass
+
 
 class CalibracionWorker(QThread if HAS_PYQT5 else object):
-    """Calibration worker - Finds tower NTU values for given operating points.
-    
-    Performs single or dual-point calibration to determine tower characteristics.
-    Inherits from QThread for PyQt5 compatibility.
-    """
-    
     if HAS_PYQT5:
         progreso_signal = pyqtSignal(str, int)
         exito_signal = pyqtSignal(dict)
         error_signal = pyqtSignal(str)
         cancelado_signal = pyqtSignal()
 
-    def __init__(self, datos_input_p1, datos_input_p2=None):
-        """Initialize calibration worker.
-        
-        Args:
-            datos_input_p1: Dictionary with point 1 data (temp, flow, humidity, etc.)
-            datos_input_p2: Optional dictionary with point 2 data for dual-point calibration
-        """
+    def __init__(self, datos_input_p1, datos_input_p2=None, tipo_equipo='crossflow'):
         super().__init__()
         self.d1 = datos_input_p1
         self.d2 = datos_input_p2
+        self.tipo_equipo = tipo_equipo
         self._is_cancelled = False
 
     def cancelar(self):
-        """Request cancellation."""
         self._is_cancelled = True
 
     def run(self):
-        """Execute calibration (called by QThread.start())."""
         try:
             N_celdas = self.d1.get('num_celdas', 6)
 
             if self.d2 is None:
-                # Single-point calibration
                 if HAS_PYQT5:
                     self.progreso_signal.emit("Calibrando Punto 1...", 50)
                 
-                res1 = resolver_punto_operacion(self.d1, N_celdas, self, pct_base=5, pct_span=85)
-                
+                res1 = resolver_punto_operacion(
+                    self.d1, N_celdas, self, pct_base=5, pct_span=85, tipo_equipo=self.tipo_equipo
+                )
                 if res1 is None or self._is_cancelled:
                     if HAS_PYQT5:
                         self.cancelado_signal.emit()
                     return
                 
                 res1['es_dual'] = False
-                
                 if HAS_PYQT5:
                     self.progreso_signal.emit("Completado", 100)
                     self.exito_signal.emit(res1)
-
             else:
-                # Dual-point calibration
                 if HAS_PYQT5:
                     self.progreso_signal.emit("Calibrando Punto 1...", 5)
                 
-                res1 = resolver_punto_operacion(self.d1, N_celdas, self, pct_base=5, pct_span=40)
+                res1 = resolver_punto_operacion(
+                    self.d1, N_celdas, self, pct_base=5, pct_span=40, tipo_equipo=self.tipo_equipo
+                )
                 if res1 is None or self._is_cancelled:
                     if HAS_PYQT5:
                         self.cancelado_signal.emit()
@@ -176,13 +150,14 @@ class CalibracionWorker(QThread if HAS_PYQT5 else object):
                 if HAS_PYQT5:
                     self.progreso_signal.emit("Calibrando Punto 2...", 50)
                 
-                res2 = resolver_punto_operacion(self.d2, N_celdas, self, pct_base=50, pct_span=40)
+                res2 = resolver_punto_operacion(
+                    self.d2, N_celdas, self, pct_base=50, pct_span=40, tipo_equipo=self.tipo_equipo
+                )
                 if res2 is None or self._is_cancelled:
                     if HAS_PYQT5:
                         self.cancelado_signal.emit()
                     return
 
-                # Calculate characteristic curve coefficients
                 lg1 = res1.get('L_G_ratio', 1.0)
                 lg2 = res2.get('L_G_ratio', 1.0)
                 ntu1 = res1.get('NTU', 1.0)
@@ -208,6 +183,7 @@ class CalibracionWorker(QThread if HAS_PYQT5 else object):
             if not self._is_cancelled and HAS_PYQT5:
                 self.error_signal.emit(str(e))
 
+
 class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
     if HAS_PYQT5:
         progreso_signal = pyqtSignal(str, int)
@@ -228,31 +204,17 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             if HAS_PYQT5:
                 self.progreso_signal.emit("Cargando y procesando archivo climático EPW...", 5)
 
-            clima = leer_archivo_epw(self.cfg['path_epw'])
+            año_ref = self.cfg.get('año_referencia', 2021)
+            clima = leer_archivo_epw(self.cfg['path_epw'], año_referencia=año_ref)
             if not clima:
                 raise ValueError("No se pudieron extraer datos válidos del archivo EPW.")
-
-            if self.cfg.get('epw_normalize'):
-                target_year = int(self.cfg.get('epw_normalize_year') or 2000)
-                clima_norm = []
-                for r in clima:
-                    dt0 = r['dt']
-                    m, d, h = dt0.month, dt0.day, dt0.hour
-                    try:
-                        ndt = datetime(target_year, m, d, h)
-                    except ValueError:
-                        ndt = datetime(target_year, m, max(1, min(28, d)), h)
-                    nr = dict(r)
-                    nr['dt'] = ndt
-                    clima_norm.append(nr)
-                clima = clima_norm
 
             f_ini = self.cfg['fecha_inicio']
             f_fin = self.cfg['fecha_fin']
             clima_filtrado = [c for c in clima if f_ini <= c['dt'] <= f_fin]
 
             if not clima_filtrado:
-                raise ValueError("El rango de fechas seleccionado no coincide con el archivo EPW.")
+                raise ValueError("El rango de fechas seleccionado no coincide con el archivo EPW procesado.")
 
             dt_sim_sec = self.cfg['dt_sim_sec']
 
@@ -296,44 +258,33 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             v_estanque_m3 = self.cfg['vol_estanque_m3']
             m_estanque_kg = max(100.0, v_estanque_m3 * 1000.0)
             tau_sec = m_estanque_kg / m_w_nom
+            fraccion_renovacion = min(0.20, dt_sim_sec / tau_sec)
 
-            # 1. Amortiguamiento dinámico de la piscina (máximo 15% de renovación por paso)
-            fraccion_renovacion = min(0.15, dt_sim_sec / tau_sec)
-
-            # 2. Delta constante del proceso térmico industrial
             delta_T_proceso = float(self.cfg['t_w_in_nom']) - T_set
-
-            # 3. Selección del modelo físico de torre
             tipo_equipo = self.cfg.get('tipo_equipo', 'crossflow')
 
             p_motor_nom_kw = self.cfg['p_motor_kw']
             eta_glob = max(0.1, min(1.0, self.cfg['eta_fan_pct'] / 100.0))
 
-            # ==========================================
-            # WARM-UP ACOPLADO DE INERCIA
-            # ==========================================
             tdb_0 = tdb_vec[0]
             twb_0 = twb_vec[0]
             patm_0 = patm_vec[0]
             w_a_in0 = w_a_in_vec[0]
             h_a_in0 = h_a_in_vec[0]
 
-            T_piscina = max(twb_0 + 1.5, T_set)
+            T_piscina = max(twb_0 + 2.0, T_set)
             T_w_in_dinamica = T_piscina + delta_T_proceso
 
-            pid.integral = 0.0
-            pid.prev_error = T_piscina - T_set
-            pid.prev_u = pid.u_min
+            pid.reset(u_inicial=self.cfg['speed_min'])
 
-            for _ in range(40):
+            for _ in range(30):
                 u_init = pid.calcular(T_set, T_piscina, dt_sim_sec)
-                # Piso de aire del 5% del nominal durante el warm-up
                 m_a_init = max(0.05 * m_a_nom, m_a_nom * (u_init / 100.0))
 
                 if tipo_equipo == 'counterflow':
                     T_sal_init, _, _, _, _, _ = simular_torre_counterflow_1d(
                         NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
-                        Nz=12, lut=lut
+                        Nz=16, lut=lut
                     )
                 else:
                     T_sal_init, _, _, _, _, _ = simular_torre_2d_matriz(
@@ -344,9 +295,6 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 T_sal_init = max(twb_0, min(T_w_in_dinamica, T_sal_init))
                 T_piscina = T_piscina + fraccion_renovacion * (T_sal_init - T_piscina)
                 T_w_in_dinamica = T_piscina + delta_T_proceso
-
-            pid.prev_error = T_piscina - T_set
-            pid.prev_u = u_init
 
             times, t_out_arr, t_in_arr, fan_speed_arr, t_wb_arr, t_db_arr, t_a_out_arr, evap_arr, q_mwt_arr, niebla_arr = [], [], [], [], [], [], [], [], [], []
             w_a_out_arr, power_kw_arr, agua_total_arr = [], [], []
@@ -359,9 +307,6 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
 
             drift_m3h = caudal_w_m3h * (pct_drift / 100.0)
 
-            # ==========================================
-            # BUCLE PRINCIPAL DE SIMULACIÓN
-            # ==========================================
             for idx in range(total_pasos):
                 if self._is_cancelled:
                     if HAS_PYQT5:
@@ -381,19 +326,16 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 h_a_in_k = h_a_in_vec[idx]
 
                 velocidad_pct = pid.calcular(T_set, T_piscina, dt_sim_sec)
-                
-                # Piso seguro para el flujo de aire (evita división por cero si m_a = 0)
                 m_a_actual = max(0.05 * m_a_nom, m_a_nom * (velocidad_pct / 100.0))
 
                 u_ratio = velocidad_pct / 100.0
                 p_elec_instantanea_kw = (p_motor_nom_kw / eta_glob) * (u_ratio ** 3)
                 energia_acum_kwh += p_elec_instantanea_kw * (dt_sim_sec / 3600.0)
 
-                # Selección y ejecución del motor termodinámico (Contraflujo vs Flujo Cruzado)
                 if tipo_equipo == 'counterflow':
                     T_salida_inst, evap_kg_s, _, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_counterflow_1d(
                         NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
-                        Nz=12, lut=lut
+                        Nz=16, lut=lut
                     )
                 else:
                     T_salida_inst, evap_kg_s, _, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_2d_matriz(
@@ -402,11 +344,10 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                     )
 
                 T_salida_inst = max(twb_k, min(T_w_in_dinamica, T_salida_inst))
-                T_a_out_prom = np.mean(Matriz_T_a[:, -1])
-                w_a_out_prom = np.mean(Matriz_w_a[:, -1])
+                T_a_out_prom = float(np.mean(Matriz_T_a[:, -1]))
+                w_a_out_prom = float(np.mean(Matriz_w_a[:, -1]))  # En kg/kg para compatibilidad psicrométrica
                 hay_niebla_paso = bool(np.any(Matriz_niebla))
 
-                # Actualización de la piscina con amortiguamiento térmico
                 T_piscina = T_piscina + fraccion_renovacion * (T_salida_inst - T_piscina)
                 T_piscina = max(twb_k, min(T_w_in_dinamica, T_piscina))
 
@@ -415,7 +356,7 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 evap_m3h = max(0.0, evap_kg_s * 3600.0 / 1000.0)
                 purga_m3h = max(0.0, (evap_m3h - drift_m3h * (coc - 1.0)) / (coc - 1.0))
 
-                dt_horas = (dt_sim_sec / 3600.0)
+                dt_horas = dt_sim_sec / 3600.0
                 agua_evap_total_m3 += evap_m3h * dt_horas
                 agua_drift_total_m3 += drift_m3h * dt_horas
                 agua_purga_total_m3 += purga_m3h * dt_horas
@@ -445,8 +386,6 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             intensidad_agua_m3_mwh = (agua_total_makeup_m3 / energia_disipada_mwh_t) if energia_disipada_mwh_t > 0 else 0.0
             intensidad_agua_m3_kwhe = (agua_total_makeup_m3 / energia_acum_kwh) if energia_acum_kwh > 0 else 0.0
 
-            vel_promedio_pct = float(np.mean(fan_speed_arr))
-
             resultado = {
                 'times': times,
                 't_out': t_out_arr,
@@ -472,7 +411,7 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 'cop_torre': cop_torre,
                 'intensidad_agua_m3_mwh': intensidad_agua_m3_mwh,
                 'intensidad_agua_m3_kwhe': intensidad_agua_m3_kwhe,
-                'vel_promedio_pct': vel_promedio_pct,
+                'vel_promedio_pct': float(np.mean(fan_speed_arr)),
                 't_setpoint': T_set,
                 'viento_medio': float(np.mean(uviento_vec)),
                 'caudal_a_m3s': self.cfg['caudal_a_m3s'],
