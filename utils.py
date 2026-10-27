@@ -391,7 +391,7 @@ TRADUCCIONES = {
         'mapa_xlabel_crossflow': "Entrada Aire Ambiente   →   Dirección del Flujo de Aire   →   Salida",
         'mapa_xlabel_counterflow': "← Sección Transversal Homogénea (Distribución Uniforme) →",
         'mapa_ylabel_crossflow': "← Caída del Agua (Techo a Piscina) →",
-        'mapa_ylabel_counterflow': "Techo (Entrada Agua / Salida Aire)   ↓   Piscina (Salida Agua / Entrada Aire)",
+        'mapa_ylabel_counterflow': "Piscina (Base)   ↑   Caída del Agua / Ascenso del Aire   ↑   Techo (Boca)",
         
         'accion_ver_psicrometrico': "Ver Carta Psicrométrica...",
         'tip_ver_psicrometrico': "Mostrar la evolución en la carta psicrométrica con control por tiempo",
@@ -606,7 +606,7 @@ TRADUCCIONES = {
         'mapa_xlabel_crossflow': "Ambient Air Inlet   →   Air Flow Direction   →   Outlet",
         'mapa_xlabel_counterflow': "← Homogeneous Cross Section (Uniform Distribution) →",
         'mapa_ylabel_crossflow': "← Water Fall (Roof to Basin) →",
-        'mapa_ylabel_counterflow': "Roof (Water In / Air Out)   ↓   Basin (Water Out / Air In)",
+        'mapa_ylabel_counterflow': "Basin (Bottom)   ↑   Water Fall / Air Rise   ↑   Roof (Top)",
         
         'accion_ver_psicrometrico': "View Psychrometric Chart...",
         'tip_ver_psicrometrico': "Show simulation evolution in psychrometric chart with time slider",

@@ -243,30 +243,31 @@ def _integrar_ntu_counterflow(T_in, T_out, h_a_in, m_w, m_a, P_atm, lut):
 
 
 def simular_torre_counterflow_1d(NTU_actual, T_w_in, m_w_total, h_a_in, w_a_in, m_a_total, 
-                                P_atm=101325.0, Nz=15, lut=None):
-    """Simulación 1D de Contraflujo analítica, monótona y exacta."""
+                                P_atm=101325.0, Nz=20, lut=None):
+    """Simulación 1D de Contraflujo acoplada termodinámicamente (Poppe).
+    
+    Fila 0 = Techo (Entrada de agua caliente, salida de aire caliente).
+    Fila Nz-1 = Piscina (Salida de agua fría, entrada de aire ambiente).
+    """
     m_a_safe = max(1e-4, float(m_a_total))
     m_w_safe = max(1e-4, float(m_w_total))
 
-    # OBTENCIÓN CORRECTA DE BULBO HÚMEDO (T_wb_in) DESDE LA ENTALPÍA DE ENTRADA
-    # La temperatura de bulbo húmedo es la temperatura de saturación cuya entalpía es h_a_in
+    # Bulbo húmedo de entrada desde entalpía y tabla LUT
     if lut is not None:
         idx_wb = int(np.searchsorted(lut.hs_lut, h_a_in))
         idx_wb = max(0, min(len(lut.T_grid) - 1, idx_wb))
         T_wb_in = float(lut.T_grid[idx_wb])
     else:
-        # Aproximación psicrométrica inversa rápida de T_wb
         T_db_est = temp_aire_desde_entalpia(h_a_in, w_a_in, P_atm)
         T_wb_in = max(0.0, T_db_est - (h_a_in - (CP_AIR_DEFAULT * T_db_est + w_a_in * H_FG0_DEFAULT)) / 2.5)
 
-    # 1. Bisección monótona de T_w_out entre el bulbo húmedo real y T_w_in
+    # 1. Bisección monótona de T_w_out
     T_low = T_wb_in + 0.1
     T_high = T_w_in - 0.1
 
     for _ in range(35):
         T_mid = 0.5 * (T_low + T_high)
         ntu_mid = _integrar_ntu_counterflow(T_w_in, T_mid, h_a_in, m_w_safe, m_a_safe, P_atm, lut)
-        # A menor temperatura de salida (más fría), mayor es el NTU requerido
         if ntu_mid > NTU_actual:
             T_low = T_mid
         else:
@@ -274,10 +275,8 @@ def simular_torre_counterflow_1d(NTU_actual, T_w_in, m_w_total, h_a_in, w_a_in, 
 
     T_w_out_final = 0.5 * (T_low + T_high)
 
-    # 2. Generación del perfil espacial vertical: Techo (k=0) a Piscina (k=Nz-1)
+    # 2. Perfil vertical del agua: de Techo (k=0) a Piscina (k=Nz-1)
     T_w_prof = np.linspace(T_w_in, T_w_out_final, Nz)
-    cp_medio = cp_agua_local((T_w_in + T_w_out_final) / 2.0)
-    Q_transf = m_w_safe * cp_medio * (T_w_in - T_w_out_final)
 
     w_a_prof = np.zeros(Nz)
     h_a_prof = np.zeros(Nz)
@@ -285,38 +284,55 @@ def simular_torre_counterflow_1d(NTU_actual, T_w_in, m_w_total, h_a_in, w_a_in, 
     fog_prof = np.zeros(Nz, dtype=bool)
 
     K_dA_capa = (NTU_actual * m_w_safe) / Nz
-    w_a_curr = w_a_in
     evap_total_kg_s = 0.0
 
-    # Integración ascendente del aire desde la base (Nz-1) hacia el techo (0)
+    # El aire entra en la base exterior por debajo de la capa Nz-1
+    h_a_corriente = h_a_in
+    w_a_corriente = w_a_in
+
+    # Integración ascendente acoplada celda a celda: desde k = Nz-1 (base) hasta k = 0 (techo)
     for k in range(Nz - 1, -1, -1):
-        Tw_k = T_w_prof[k]
+        Tw_cell = T_w_prof[k]
+        cp_w_cell = cp_agua_local(Tw_cell)
+
         if lut is not None:
-            w_sw, _ = lut.get_ws_hs(Tw_k)
+            w_sw, h_sw = lut.get_ws_hs(Tw_cell)
         else:
-            w_sw = humedad_saturacion(Tw_k, P_atm)
+            w_sw = humedad_saturacion(Tw_cell, P_atm)
+            h_sw = entalpia_saturacion(Tw_cell, w_sw, P_atm)
 
-        pot_w = max(0.0, w_sw - w_a_curr)
-        dm_evap = min(K_dA_capa * pot_w, 0.02 * m_w_safe / Nz)
-        evap_total_kg_s += dm_evap
+        h_v = H_FG0_DEFAULT + CP_VAPOR_DEFAULT * Tw_cell
+        Le = factor_lewis(w_sw, w_a_corriente)
 
-        w_a_curr += dm_evap / m_a_safe
-        
-        frac_calor = (T_w_in - Tw_k) / max(1e-4, (T_w_in - T_w_out_final))
-        ha_k = h_a_in + (Q_transf / m_a_safe) * (1.0 - frac_calor)
+        potencial_w = max(0.0, w_sw - w_a_corriente)
+        potencial_h = (h_sw - h_a_corriente) + (Le - 1.0) * (h_sw - h_a_corriente - potencial_w * h_v) + potencial_w * cp_w_cell * Tw_cell
 
-        w_a_prof[k] = w_a_curr
-        h_a_prof[k] = ha_k
+        dm_evap_cell = min(K_dA_capa * potencial_w, 0.02 * m_w_safe / Nz)
+        dQ_cell = K_dA_capa * potencial_h
 
-        Ta_k = temp_aire_desde_entalpia(ha_k, w_a_curr, P_atm)
-        T_a_prof[k] = Ta_k
-        w_sat_local = lut.get_ws_hs(Ta_k)[0] if lut is not None else humedad_saturacion(Ta_k, P_atm)
-        fog_prof[k] = (w_a_curr > w_sat_local)
+        evap_total_kg_s += dm_evap_cell
 
+        # El aire absorbe la masa y el calor en esta capa al ascender
+        w_a_corriente += dm_evap_cell / m_a_safe
+        h_a_corriente += dQ_cell / m_a_safe
+
+        # Asignación al nodo k
+        w_a_prof[k] = w_a_corriente
+        h_a_prof[k] = h_a_corriente
+
+        Ta_cell = temp_aire_desde_entalpia(h_a_corriente, w_a_corriente, P_atm)
+        T_a_prof[k] = Ta_cell
+
+        w_sat_local = lut.get_ws_hs(Ta_cell)[0] if lut is not None else humedad_saturacion(Ta_cell, P_atm)
+        fog_prof[k] = bool(w_a_corriente > w_sat_local)
+
+    # Matrices bidimensionales adaptadas (extrusión homogénea horizontal):
+    # Fila 0 (arriba) = Techo
+    # Fila Nz-1 (abajo) = Piscina
     T_w_matriz = np.tile(T_w_prof, (Nz, 1)).T
-    w_a_matriz = np.tile(w_a_prof, (Nz, 1))
-    T_a_matriz = np.tile(T_a_prof, (Nz, 1))
-    fog_matriz = np.tile(fog_prof, (Nz, 1))
+    w_a_matriz = np.tile(w_a_prof, (Nz, 1)).T
+    T_a_matriz = np.tile(T_a_prof, (Nz, 1)).T
+    fog_matriz = np.tile(fog_prof, (Nz, 1)).T
 
     return float(T_w_out_final), float(evap_total_kg_s), T_w_matriz, w_a_matriz, T_a_matriz, fog_matriz
 
