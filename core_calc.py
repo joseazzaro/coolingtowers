@@ -439,3 +439,92 @@ def resolver_punto_operacion(datos_p, N_celdas, worker_ref, pct_base, pct_span):
         'T_w_in': T_piscina,
         'num_celdas': N_celdas
     }
+
+def simular_torre_counterflow_1d(NTU_actual, T_w_in, m_w_total, h_a_in, w_a_in, m_a_total, 
+                                P_atm=101325.0, Nz=12, lut=None):
+    """Simulación 1D de Torre de Enfriamiento a Contraflujo (Counterflow).
+    
+    El agua cae desde z=Nz a z=0. El aire entra por z=0 y sale por z=Nz.
+    """
+    m_a_total_safe = max(1e-4, float(m_a_total))
+    K_dA_total = NTU_actual * m_w_total
+    dK_dA = K_dA_total / Nz
+    
+    # Vectores de estado (Nz + 1 nodos)
+    T_w = np.zeros(Nz + 1)
+    m_w = np.zeros(Nz + 1)
+    h_a = np.zeros(Nz + 1)
+    w_a = np.zeros(Nz + 1)
+    
+    fog_vector = np.zeros(Nz, dtype=bool)
+    T_a_vector = np.zeros(Nz)
+    
+    # Condición de entrada de aire (z = 0)
+    h_a[0] = h_a_in
+    w_a[0] = w_a_in
+    
+    # Condición de entrada de agua en el techo (z = Nz)
+    T_w[Nz] = T_w_in
+    m_w[Nz] = m_w_total
+    
+    # Estimación inicial de temperatura de agua en la piscina (z = 0)
+    T_w_salida_est = max(1.0, T_w_in - 5.0)
+    T_w[0] = T_w_salida_est
+    m_w[0] = m_w_total
+    
+    # Integración / Discretización de capas de abajo hacia arriba (z = 0 -> Nz)
+    for iter_fit in range(15):  # Iteraciones de convergencia de contraflujo
+        for k in range(Nz):
+            T_water_cell = T_w[k]
+            m_water_cell = m_w[k]
+            h_air_cell = h_a[k]
+            w_air_cell = w_a[k]
+            
+            cp_w_local = cp_agua_local(T_water_cell)
+            
+            if lut is not None:
+                w_sw, h_sw = lut.get_ws_hs(T_water_cell)
+            else:
+                w_sw = humedad_saturacion(T_water_cell, P_atm)
+                h_sw = entalpia_saturacion(T_water_cell, w_sw, P_atm)
+                
+            h_v = H_FG0_DEFAULT + CP_VAPOR_DEFAULT * T_water_cell
+            Le = factor_lewis(w_sw, w_air_cell)
+            
+            potencial_w = max(0.0, w_sw - w_air_cell)
+            potencial_h = (h_sw - h_air_cell) + (Le - 1) * (h_sw - h_air_cell - potencial_w * h_v) + potencial_w * cp_w_local * T_water_cell
+            
+            agua_evap_capa = dK_dA * potencial_w
+            calor_trans_capa = dK_dA * potencial_h
+            
+            w_a[k+1] = w_air_cell + (agua_evap_capa / m_a_total_safe)
+            h_a[k+1] = h_air_cell + (calor_trans_capa / m_a_total_safe)
+            
+            T_a_next = temp_aire_desde_entalpia(h_a[k+1], w_a[k+1], P_atm)
+            T_a_vector[k] = T_a_next
+            
+            w_sat_local = lut.get_ws_hs(T_a_next)[0] if lut is not None else humedad_saturacion(T_a_next, P_atm)
+            if w_a[k+1] > w_sat_local:
+                fog_vector[k] = True
+                
+            m_w[k+1] = max(1e-6, m_water_cell + agua_evap_capa)
+            den_e = m_w[k+1] * cp_w_local
+            T_w_calc = (m_water_cell * cp_w_local * T_water_cell + calor_trans_capa) / den_e if den_e > 0 else T_w_in
+            T_w[k+1] = max(-10.0, min(T_w_in, T_w_calc))
+
+        # Corrección de la cota superior del techo T_w[Nz] hacia T_w_in
+        error_techo = T_w_in - T_w[Nz]
+        T_w[0] += 0.8 * error_techo
+        if abs(error_techo) < 1e-3:
+            break
+
+    T_w_salida_final = T_w[0]
+    agua_evaporada_total = max(0.0, m_w[Nz] - m_w[0])
+    
+    # Matriz 2D equivalente para la interfaz visual
+    T_w_matriz = np.tile(T_w[:-1], (Nz, 1)).T
+    w_a_matriz = np.tile(w_a[1:], (Nz, 1))
+    T_a_matriz = np.tile(T_a_vector, (Nz, 1))
+    fog_matriz = np.tile(fog_vector, (Nz, 1))
+
+    return T_w_salida_final, agua_evaporada_total, T_w_matriz, w_a_matriz, T_a_matriz, fog_matriz

@@ -7,13 +7,19 @@ For web/mobile platforms, extract the run() method logic into pure functions.
 
 import numpy as np
 from datetime import datetime, timedelta
-from core_calc import (
-    simular_torre_2d_matriz, resolver_punto_operacion, obtener_presion_barometrica,
-    humedad_saturacion, temp_aire_desde_entalpia,
-    CP_WATER_DEFAULT, CP_AIR_DEFAULT, CP_VAPOR_DEFAULT, H_FG0_DEFAULT,
-)
 from psychro_data import PsicroLUT
 from utils import leer_archivo_epw
+# --- AGREGAR 'simular_torre_counterflow_1d' EN LA IMPORTACIÓN ---
+from core_calc import (
+    simular_torre_2d_matriz,
+    simular_torre_counterflow_1d,  # <-- ¡AQUÍ ESTÁ LA LÍNEA QUE FALTA!
+    resolver_punto_operacion,
+    obtener_presion_barometrica,
+    humedad_saturacion,
+    temp_aire_desde_entalpia,
+    CP_WATER_DEFAULT, CP_AIR_DEFAULT, CP_VAPOR_DEFAULT, H_FG0_DEFAULT,
+)
+
 
 # ==========================================
 # PID CONTROLLER
@@ -291,11 +297,14 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             m_estanque_kg = max(100.0, v_estanque_m3 * 1000.0)
             tau_sec = m_estanque_kg / m_w_nom
 
-            # CAMBIO 1: Amortiguamiento dinámico de la piscina (máximo 15% de renovación por paso)
+            # 1. Amortiguamiento dinámico de la piscina (máximo 15% de renovación por paso)
             fraccion_renovacion = min(0.15, dt_sim_sec / tau_sec)
 
-            # CAMBIO 2: Delta constante del proceso térmico industrial
+            # 2. Delta constante del proceso térmico industrial
             delta_T_proceso = float(self.cfg['t_w_in_nom']) - T_set
+
+            # 3. Selección del modelo físico de torre
+            tipo_equipo = self.cfg.get('tipo_equipo', 'crossflow')
 
             p_motor_nom_kw = self.cfg['p_motor_kw']
             eta_glob = max(0.1, min(1.0, self.cfg['eta_fan_pct'] / 100.0))
@@ -318,13 +327,20 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
 
             for _ in range(40):
                 u_init = pid.calcular(T_set, T_piscina, dt_sim_sec)
-                # Piso de aire del 5% del nominal durante warm-up
+                # Piso de aire del 5% del nominal durante el warm-up
                 m_a_init = max(0.05 * m_a_nom, m_a_nom * (u_init / 100.0))
 
-                T_sal_init, _, _, _, _, _ = simular_torre_2d_matriz(
-                    NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
-                    Nx=6, Ny=6, lut=lut
-                )
+                if tipo_equipo == 'counterflow':
+                    T_sal_init, _, _, _, _, _ = simular_torre_counterflow_1d(
+                        NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
+                        Nz=12, lut=lut
+                    )
+                else:
+                    T_sal_init, _, _, _, _, _ = simular_torre_2d_matriz(
+                        NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
+                        Nx=6, Ny=6, lut=lut
+                    )
+
                 T_sal_init = max(twb_0, min(T_w_in_dinamica, T_sal_init))
                 T_piscina = T_piscina + fraccion_renovacion * (T_sal_init - T_piscina)
                 T_w_in_dinamica = T_piscina + delta_T_proceso
@@ -344,13 +360,19 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             drift_m3h = caudal_w_m3h * (pct_drift / 100.0)
 
             # ==========================================
-            # BUCLE PRINCIPAL
+            # BUCLE PRINCIPAL DE SIMULACIÓN
             # ==========================================
             for idx in range(total_pasos):
                 if self._is_cancelled:
                     if HAS_PYQT5:
                         self.cancelado_signal.emit()
                     return
+
+                if HAS_PYQT5 and idx % max(1, total_pasos // 50) == 0:
+                    pct = int(10 + (idx / total_pasos) * 85)
+                    sec = time_steps_sec[idx]
+                    dt_actual = clima_filtrado[0]['dt'] + timedelta(seconds=float(sec))
+                    self.progreso_signal.emit(f"Simulando {dt_actual.strftime('%d/%m %H:%M')}...", pct)
 
                 tdb_k = tdb_vec[idx]
                 twb_k = twb_vec[idx]
@@ -360,24 +382,31 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
 
                 velocidad_pct = pid.calcular(T_set, T_piscina, dt_sim_sec)
                 
-                # CAMBIO 3: Piso seguro para el flujo de aire (evita m_a = 0)
+                # Piso seguro para el flujo de aire (evita división por cero si m_a = 0)
                 m_a_actual = max(0.05 * m_a_nom, m_a_nom * (velocidad_pct / 100.0))
 
                 u_ratio = velocidad_pct / 100.0
                 p_elec_instantanea_kw = (p_motor_nom_kw / eta_glob) * (u_ratio ** 3)
                 energia_acum_kwh += p_elec_instantanea_kw * (dt_sim_sec / 3600.0)
 
-                T_salida_inst, evap_kg_s, _, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_2d_matriz(
-                    NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
-                    Nx=6, Ny=6, lut=lut
-                )
+                # Selección y ejecución del motor termodinámico (Contraflujo vs Flujo Cruzado)
+                if tipo_equipo == 'counterflow':
+                    T_salida_inst, evap_kg_s, _, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_counterflow_1d(
+                        NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
+                        Nz=12, lut=lut
+                    )
+                else:
+                    T_salida_inst, evap_kg_s, _, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_2d_matriz(
+                        NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
+                        Nx=6, Ny=6, lut=lut
+                    )
 
                 T_salida_inst = max(twb_k, min(T_w_in_dinamica, T_salida_inst))
                 T_a_out_prom = np.mean(Matriz_T_a[:, -1])
                 w_a_out_prom = np.mean(Matriz_w_a[:, -1])
                 hay_niebla_paso = bool(np.any(Matriz_niebla))
 
-                # Actualización de la piscina con inercia y límites físicos de seguridad
+                # Actualización de la piscina con amortiguamiento térmico
                 T_piscina = T_piscina + fraccion_renovacion * (T_salida_inst - T_piscina)
                 T_piscina = max(twb_k, min(T_w_in_dinamica, T_piscina))
 

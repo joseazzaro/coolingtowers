@@ -57,7 +57,6 @@ cp_v_def = CP_VAPOR_DEFAULT       # 1.86 kJ/kg.K
 h_fg0_def = H_FG0_DEFAULT         # 2501.0 kJ/kg
 
 
-
 # ==========================================
 # UI DIALOG CLASSES - Main application logic
 # ==========================================
@@ -146,15 +145,12 @@ class DialogoSegundoPunto(QDialog):
             'altitud': self.datos_p1['altitud'],
             'num_celdas': self.datos_p1['num_celdas']
         }
-    
+
 # ==========================================
-# 6. DIÁLOGO EMERGENTE CON SELECTOR HORA A HORA DE PLUMA (BRIGGS 2D)
+# DIÁLOGOS Y NAVEGACIÓN TEMPORAL DE PLUMA / PSICROMETRÍA
 # ==========================================
 from PyQt5.QtWidgets import QSlider
 
-# ==========================================
-# 6. DIÁLOGO EMERGENTE DE PLUMA CON UI GEOMÉTRICA COMPLETA
-# ==========================================
 class DialogoPerfilPluma(QDialog):
     def __init__(self, parent=None, datos_sim=None, idioma='es'):
         super().__init__(parent)
@@ -170,13 +166,11 @@ class DialogoPerfilPluma(QDialog):
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # Encabezado
         lbl_info = QLabel(self.tr_txt('pluma_info'))
         lbl_info.setFont(QFont("Segoe UI", 10, QFont.Bold))
         lbl_info.setStyleSheet("color: #2C3E50;")
         layout.addWidget(lbl_info)
 
-        # --- AQUI SE AGREGA LA SECCIÓN VISUAL DE GEOMETRÍA DE LA TORRE ---
         gb_geom = QGroupBox(self.tr_txt('pluma_gb_geom'))
         gb_geom.setStyleSheet("""
             QGroupBox {
@@ -210,7 +204,6 @@ class DialogoPerfilPluma(QDialog):
         lbl_u_h = QLabel("m")
         lbl_u_h.setFont(QFont("Segoe UI", 8))
 
-        # Reconectar cambios para actualizar la gráfica al editar geometría
         self.txt_diametro_boca.editingFinished.connect(self.recalcular_actual)
         self.txt_altura_torre.editingFinished.connect(self.recalcular_actual)
 
@@ -225,7 +218,6 @@ class DialogoPerfilPluma(QDialog):
 
         layout.addWidget(gb_geom)
 
-        # Canvas Matplotlib
         self.fig = Figure(figsize=(8, 4.0), dpi=100)
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -233,13 +225,11 @@ class DialogoPerfilPluma(QDialog):
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
 
-        # KPIs del Instante
         self.lbl_kpis_pluma = QLabel(self.tr_txt('pluma_kpis_default'))
         self.lbl_kpis_pluma.setFont(QFont("Segoe UI", 9))
         self.lbl_kpis_pluma.setStyleSheet("background-color: #F4F6F7; padding: 8px; border-radius: 4px; color: #1A252F;")
         layout.addWidget(self.lbl_kpis_pluma)
 
-        # PANEL DE CONTROL TEMPORAL
         gb_control = QGroupBox(self.tr_txt('pluma_gb_control'))
         layout_ctrl = QHBoxLayout(gb_control)
 
@@ -265,8 +255,6 @@ class DialogoPerfilPluma(QDialog):
         layout_ctrl.addWidget(self.btn_worst_case)
 
         layout.addWidget(gb_control)
-
-        # Cargar primer instante
         self.actualizar_instante(0)
 
     def recalcular_actual(self):
@@ -305,7 +293,6 @@ class DialogoPerfilPluma(QDialog):
         caudal_a = float(self.datos_sim['caudal_a_m3s'])
         caudal_a_actual = max(0.1, caudal_a * (vel_fan_pct / 100.0))
 
-        # LECTURA SEGURO DE GEOMETRÍA CON FALLBACK SI EL CAMPO QUEDA VACÍO
         try:
             H_torre = float(self.txt_altura_torre.text().replace(',', '.'))
         except ValueError:
@@ -327,11 +314,10 @@ class DialogoPerfilPluma(QDialog):
         
         x_vec = np.linspace(0.1, 160.0, 300)
         z_centron = (H_torre + D_boca / 2.0) + (3.0 * F_b * (x_vec**2) / (2.0 * 0.6**2 * (u_wind**3)))**(1.0 / 3.0)
-        # 2. Expansión progresiva que nace exacta en el borde de la boca (x = 0)
         sigma_z = 0.12 * (x_vec**0.88) + (D_boca / 2.0) * (1.0 - np.exp(-x_vec / 2.0))
 
         z_top = z_centron + sigma_z
-        z_bot = np.maximum(H_torre, z_centron - sigma_z) # La cota inferior nunca cae por debajo del techo en x=0
+        z_bot = np.maximum(H_torre, z_centron - sigma_z)
 
         w_amb = humedad_saturacion(T_wb_amb)
         w_out = humedad_saturacion(T_a_out)
@@ -350,11 +336,9 @@ class DialogoPerfilPluma(QDialog):
         L_pluma_vis = float(x_vis[-1]) if len(x_vis) > 0 else 0.0
         H_max_vis = float(np.max(z_top_vis)) if len(z_top_vis) > 0 else H_torre
 
-        # DIBUJAR EN MATPLOTLIB
         self.fig.clear()
         ax = self.fig.add_subplot(111)
 
-        # Centra la estructura entre X = -D_boca/2 y X = D_boca/2 para que coincida con x = 0
         ax.add_patch(matplotlib.patches.Rectangle((-D_boca / 2.0, 0), D_boca, H_torre, color='#34495E', alpha=0.85, label=self.tr_txt('pluma_torre_label')))
         ax.plot([-D_boca / 2.0, -D_boca / 2.0], [H_torre, H_torre + 1.0], color='#1A252F', linewidth=2.5)
         ax.plot([D_boca / 2.0, D_boca / 2.0], [H_torre, H_torre + 1.0], color='#1A252F', linewidth=2.5)
@@ -405,14 +389,12 @@ class DialogoPsicrometrico(QDialog):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        # Matplotlib canvas
         self.fig = Figure(figsize=(6.5, 4.5), dpi=100)
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
 
-        # Controls
         ctrl = QHBoxLayout()
         self.lbl_fecha = QLabel(self.tr_txt('pluma_fecha_default'))
         self.slider = QSlider(Qt.Horizontal)
@@ -425,7 +407,6 @@ class DialogoPsicrometrico(QDialog):
         ctrl.addWidget(self.slider, stretch=1)
         layout.addLayout(ctrl)
 
-        # Initial draw
         self.actualizar_instante(0)
 
     def actualizar_instante(self, idx):
@@ -434,33 +415,26 @@ class DialogoPsicrometrico(QDialog):
         t = self.datos_sim['times'][idx]
         self.lbl_fecha.setText(self.tr_txt('pluma_fecha_texto', fecha=t.strftime('%d/%m/%Y %H:%M')))
 
-        # Prepare psychrometric plot: x = T_a_out (tower outlet), y = w_a_out (outlet humidity ratio)
-        # Fog forms when outlet air reaches saturation curve
         T_a_out = np.array(self.datos_sim.get('t_a_out', []))
         w_a_out = np.array(self.datos_sim.get('w_a_out', []))
         
-        # Convert outlet humidity from kg/kg to g/kg for display
         P_atm = 101325.0
         lut = PsicroLUT(T_min=-20.0, T_max=80.0, step=0.1, P_atm=P_atm)
-        w_a_out_g = w_a_out * 1000.0  # Convert to g/kg
+        w_a_out_g = w_a_out * 1000.0
 
         self.fig.clear()
         ax = self.fig.add_subplot(111)
 
-        # saturation curve (ws) from LUT (convert to g/kg for display)
         T_sat = lut.T_grid
         w_sat = lut.ws_lut
         w_sat_g = w_sat * 1000.0
         ax.plot(T_sat, w_sat_g, color='#2980B9', linestyle='--', linewidth=1.0, label=self.tr_txt('plot_saturation'))
 
-        # plot trajectory: tower outlet temperature vs outlet humidity ratio (in g/kg)
         if len(T_a_out) > 0:
             ax.plot(T_a_out, w_a_out_g, color='#7F8C8D', alpha=0.6, label='Outlet Air')
-        # mark current instant
         if idx < len(T_a_out):
             ax.scatter([T_a_out[idx]], [w_a_out_g[idx]], color='#C0392B', s=60, zorder=10)
 
-        # X-axis limits: Fixed range 15-40°C for typical tower outlet conditions
         ax.set_xlim(15.0, 40.0)
 
         visible_sat = w_sat_g[(T_sat >= 15.0) & (T_sat <= 40.0)]
@@ -484,8 +458,6 @@ class DialogoPsicrometrico(QDialog):
 
 
 class DialogoDuracionAcumulada(QDialog):
-    """Cumulative (load) duration curve: metrics sorted descending vs accumulated operating hours."""
-
     def __init__(self, parent=None, datos_sim=None, idioma='es'):
         super().__init__(parent)
         self.idioma = idioma
@@ -523,7 +495,6 @@ class DialogoDuracionAcumulada(QDialog):
         self.replot()
 
     def _curva_duracion(self, values):
-        """Sort values descending and pair them with accumulated operating hours."""
         arr = np.asarray(values, dtype=float)
         if arr.size == 0:
             return arr, arr
@@ -589,7 +560,7 @@ class DialogoDuracionAcumulada(QDialog):
 
 
 # ==========================================
-# 7. VENTANA EMERGENTE DE SIMULACIÓN DINÁMICA
+# VENTANA EMERGENTE DE SIMULACIÓN DINÁMICA
 # ==========================================
 class DialogoEpwChoice(QDialog):
     def __init__(self, parent=None, years=None, idioma='es'):
@@ -630,7 +601,6 @@ class DialogoEpwChoice(QDialog):
             info.setStyleSheet('color: #555555; font-size: 11px;')
             layout.addWidget(info)
 
-        # Remember choice checkbox
         self.chk_remember = QCheckBox(self.tr_txt('epw_multi_remember'))
         layout.addWidget(self.chk_remember)
 
@@ -644,7 +614,6 @@ class DialogoEpwChoice(QDialog):
             self.choice = {'action': 'normalize', 'year': int(self.spin_year.value())}
         else:
             self.choice = {'action': 'preserve', 'year': None}
-        # persist if requested
         try:
             if self.chk_remember.isChecked():
                 settings = QSettings('cooling_towers', 'tower_app')
@@ -764,7 +733,6 @@ class VentanaSimulacionDinamica(QDialog):
         self.txt_ti = QLineEdit("1800.0")
         self.txt_td = QLineEdit("0.0")
         self.txt_speed_min = QLineEdit("20.0")
-        # --- NUEVOS CAMPOS: Banda Muerta y Rampa Máxima ---
         self.txt_deadband = QLineEdit("0.3")
         self.txt_max_rate = QLineEdit("5.0")
 
@@ -794,7 +762,6 @@ class VentanaSimulacionDinamica(QDialog):
         grid_pid.addWidget(self.txt_speed_min, 4, 1)
         grid_pid.addWidget(QLabel("%"), 4, 2)
 
-        # --- AGREGAR A LA GRILLA ---
         grid_pid.addWidget(QLabel("Banda Muerta (Deadband):"), 5, 0)
         grid_pid.addWidget(self.txt_deadband, 5, 1)
         grid_pid.addWidget(QLabel("°C"), 5, 2)
@@ -939,9 +906,7 @@ class VentanaSimulacionDinamica(QDialog):
         main_layout.addWidget(panel_grafica, stretch=7)
         main_layout.addWidget(panel_derecho, stretch=2)
 
-    # Dialog to allow user choice when EPW contains multiple source years
     def _prompt_epw_year_choice(self, years):
-        # Check saved preference first
         try:
             settings = QSettings('cooling_towers', 'tower_app')
             saved_action = settings.value('epw_choice_action', '')
@@ -968,31 +933,24 @@ class VentanaSimulacionDinamica(QDialog):
                 clima = leer_archivo_epw(file_path)
                 if clima:
                     years = sorted(set(c['dt'].year for c in clima))
-                    # si hay múltiples años, preguntar al usuario cómo tratarlos
                     if len(years) > 1:
                         choice = self._prompt_epw_year_choice(years)
                     else:
                         choice = {'action': 'preserve', 'year': None}
 
-                    # aplicar normalización solo para la vista previa (y recordar decisión para la simulación)
                     self.epw_normalize = (choice['action'] == 'normalize')
                     self.epw_normalize_year = int(choice['year']) if choice.get('year') else None
 
                     if self.epw_normalize and self.epw_normalize_year:
-                        # crear copia normalizada de las entradas para la vista
                         clima_preview = []
                         for r in clima:
                             dt0 = r['dt']
                             y = self.epw_normalize_year
-                            m = dt0.month
-                            d = dt0.day
-                            h = dt0.hour
-                            # ajustar días inválidos (e.g., Feb 29)
+                            m, d, h = dt0.month, dt0.day, dt0.hour
                             valid_dt = None
                             try:
                                 valid_dt = datetime(y, m, d, h)
                             except ValueError:
-                                # intentar retroceder hasta fecha válida
                                 for dd in (28, 27, 26, 25):
                                     try:
                                         valid_dt = datetime(y, m, dd, h)
@@ -1010,9 +968,7 @@ class VentanaSimulacionDinamica(QDialog):
 
                     dt_min = min(c['dt'] for c in clima_use)
                     dt_max = max(c['dt'] for c in clima_use)
-                    # usar la fecha mínima encontrada como inicio
                     q_ini = QDate(dt_min.year, dt_min.month, dt_min.day)
-                    # por defecto mostrar una ventana de 7 días o hasta la fecha máxima disponible
                     dt_fin_def = dt_min + timedelta(days=6)
                     dt_fin_use = dt_fin_def if dt_fin_def <= dt_max else dt_max
                     q_fin = QDate(dt_fin_use.year, dt_fin_use.month, dt_fin_use.day)
@@ -1031,7 +987,13 @@ class VentanaSimulacionDinamica(QDialog):
             d_ini = self.date_ini.date()
             d_fin = self.date_fin.date()
 
+            # LECTURA DEL TIPO DE EQUIPO DESDE LA VENTANA PRINCIPAL
+            tipo_eq = 'crossflow'
+            if self.parent() and hasattr(self.parent(), 'tipo_equipo_actual'):
+                tipo_eq = self.parent().tipo_equipo_actual
+
             cfg = {
+                'tipo_equipo': tipo_eq,
                 'path_epw': path_epw,
                 'fecha_inicio': datetime(d_ini.year(), d_ini.month(), d_ini.day(), 0, 0),
                 'fecha_fin': datetime(d_fin.year(), d_fin.month(), d_fin.day(), 23, 59),
@@ -1054,7 +1016,6 @@ class VentanaSimulacionDinamica(QDialog):
                 't_w_in_nom': self.datos_torre['T_w_in'],
                 'ntu_ref': self.datos_torre['NTU']
             }
-            # incluir la preferencia de normalización EPW si fue seleccionada
             cfg['epw_normalize'] = getattr(self, 'epw_normalize', False)
             cfg['epw_normalize_year'] = getattr(self, 'epw_normalize_year', None)
 
@@ -1088,7 +1049,6 @@ class VentanaSimulacionDinamica(QDialog):
 
         self.actualizar_labels_kpi(res)
 
-        # Notificar a la ventana principal para activar el menú de Pluma
         if self.parent() and hasattr(self.parent(), 'actualizar_resultado_dinamico'):
             self.parent().actualizar_resultado_dinamico(res)
 
@@ -1346,7 +1306,7 @@ class VentanaSimulacionDinamica(QDialog):
         self.canvas.draw()
 
 # ==========================================
-# 8. CANVA DE MATPLOTLIB 2D
+# CANVA DE MATPLOTLIB 2D
 # ==========================================
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None, width=6, height=6, dpi=100):
@@ -1414,7 +1374,7 @@ class MplCanvas(FigureCanvas):
         self.draw()
 
 # ==========================================
-# 9. VENTANA PRINCIPAL DE PyQt5 CON OPCIÓN DE PLUMA EN MENÚ
+# VENTANA PRINCIPAL DE PyQt5 CON MENÚ EQUIPO
 # ==========================================
 class TorreCoolingApp(QMainWindow):
     def __init__(self):
@@ -1426,6 +1386,7 @@ class TorreCoolingApp(QMainWindow):
         self.ultimo_resultado = None
         self.ultimo_resultado_dinamico = None
         self.ultimo_estado_sim = None
+        self.tipo_equipo_actual = 'crossflow'  # Por defecto: Flujo Cruzado
 
         self.init_menu()
         self.init_ui()
@@ -1440,8 +1401,38 @@ class TorreCoolingApp(QMainWindow):
         self.idioma = lang
         self.retranslate_ui()
 
+    def seleccionar_equipo(self, tipo):
+        self.tipo_equipo_actual = tipo
+        nombre = "Flujo Cruzado (Crossflow)" if tipo == 'crossflow' else "Contraflujo (Counterflow)"
+        self.status_bar.showMessage(f"Tipo de Equipo seleccionado: {nombre}")
+
     def init_menu(self):
         menubar = self.menuBar()
+
+        # ==========================================
+        # 1. MENÚ SUPERIOR: EQUIPO (PRIMER LUGAR)
+        # ==========================================
+        self.menu_equipo = menubar.addMenu("Equipo")
+        
+        self.action_crossflow = QAction("Torre Flujo Cruzado (Crossflow)", self)
+        self.action_crossflow.setCheckable(True)
+        self.action_crossflow.setChecked(True)
+        self.action_crossflow.triggered.connect(lambda: self.seleccionar_equipo('crossflow'))
+
+        self.action_counterflow = QAction("Torre Contraflujo (Counterflow)", self)
+        self.action_counterflow.setCheckable(True)
+        self.action_counterflow.triggered.connect(lambda: self.seleccionar_equipo('counterflow'))
+
+        grupo_equipo = QActionGroup(self)
+        grupo_equipo.addAction(self.action_crossflow)
+        grupo_equipo.addAction(self.action_counterflow)
+
+        self.menu_equipo.addAction(self.action_crossflow)
+        self.menu_equipo.addAction(self.action_counterflow)
+
+        # ==========================================
+        # 2. MENÚ SUPERIOR: SIMULACIÓN
+        # ==========================================
         self.menu_simulacion = menubar.addMenu("Simulación")
 
         self.action_sim_dinamica = QAction(self)
@@ -1449,29 +1440,24 @@ class TorreCoolingApp(QMainWindow):
         self.action_sim_dinamica.triggered.connect(self.abrir_simulacion_dinamica)
         self.menu_simulacion.addAction(self.action_sim_dinamica)
 
-        # NUEVA OPCIÓN: PERFIL DE PLUMA BRIGGS 2D
         self.action_ver_pluma = QAction(self)
         self.action_ver_pluma.setEnabled(False)
         self.action_ver_pluma.triggered.connect(self.abrir_ventana_pluma)
         self.menu_simulacion.addAction(self.action_ver_pluma)
 
-        # Psychrometric chart action
         self.action_psicrometrico = QAction(self)
         self.action_psicrometrico.setEnabled(False)
         self.action_psicrometrico.triggered.connect(self.abrir_ventana_psicrometrico)
         self.menu_simulacion.addAction(self.action_psicrometrico)
 
-        # Cumulative duration curve action
         self.action_duracion = QAction(self)
         self.action_duracion.setEnabled(False)
         self.action_duracion.triggered.connect(self.abrir_ventana_duracion)
         self.menu_simulacion.addAction(self.action_duracion)
 
-        # Action to clear saved EPW preference (placed under Settings menu)
-        self.action_clear_epw_choice = QAction(self)
-        self.action_clear_epw_choice.triggered.connect(self._clear_saved_epw_choice)
-
-        # MENÚ DE IDIOMA
+        # ==========================================
+        # 3. MENÚ SUPERIOR: IDIOMA
+        # ==========================================
         self.menu_idioma = menubar.addMenu("Idioma")
         self.action_idioma_es = QAction(self)
         self.action_idioma_es.setCheckable(True)
@@ -1487,17 +1473,23 @@ class TorreCoolingApp(QMainWindow):
 
         self.menu_idioma.addAction(self.action_idioma_es)
         self.menu_idioma.addAction(self.action_idioma_en)
-        # SETTINGS MENU
+
+        # ==========================================
+        # 4. MENÚ SUPERIOR: CONFIGURACIÓN
+        # ==========================================
+        self.action_clear_epw_choice = QAction(self)
+        self.action_clear_epw_choice.triggered.connect(self._clear_saved_epw_choice)
+
         self.menu_settings = menubar.addMenu(self.tr_txt('menu_settings'))
         self.menu_settings.addAction(self.action_clear_epw_choice)
-        # Reset all preferences action
+        
         self.action_reset_prefs = QAction(self)
         self.action_reset_prefs.triggered.connect(self._reset_all_preferences)
         self.menu_settings.addAction(self.action_reset_prefs)
-        # set texts for language actions and simulation menu items
+
+        # Asignación de textos según idioma
         self.action_idioma_es.setText(self.tr_txt('idioma_es'))
         self.action_idioma_en.setText(self.tr_txt('idioma_en'))
-        # simulation menu items text
         self.action_sim_dinamica.setText(self.tr_txt('accion_sim_dinamica'))
         self.action_sim_dinamica.setToolTip(self.tr_txt('tip_sim_dinamica'))
         self.action_ver_pluma.setText(self.tr_txt('accion_ver_pluma'))
@@ -1507,7 +1499,6 @@ class TorreCoolingApp(QMainWindow):
         self.action_duracion.setText(self.tr_txt('accion_ver_duracion'))
         self.action_duracion.setToolTip(self.tr_txt('tip_ver_duracion'))
         self.action_clear_epw_choice.setText(self.tr_txt('sim_clear_epw_choice'))
-        # reset prefs menu item
         self.action_reset_prefs.setText(self.tr_txt('sim_reset_prefs'))
 
     def _clear_saved_epw_choice(self):
@@ -1542,7 +1533,6 @@ class TorreCoolingApp(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
-        # SECCIÓN IZQUIERDA
         panel_izquierdo = QWidget()
         layout_izq = QVBoxLayout(panel_izquierdo)
         layout_izq.setContentsMargins(10, 10, 10, 10)
@@ -1577,7 +1567,6 @@ class TorreCoolingApp(QMainWindow):
         gb_aire.setLayout(grid_aire)
         layout_izq.addWidget(gb_aire)
 
-        # BOTONES: CALIBRAR 1 PUNTO Y AJUSTE 2 PUNTOS
         layout_botones = QHBoxLayout()
         self.btn_calcular = QPushButton()
         self.btn_calcular.setFont(QFont("Segoe UI", 9))
@@ -1594,9 +1583,7 @@ class TorreCoolingApp(QMainWindow):
         layout_botones.addWidget(self.btn_calcular)
         layout_botones.addWidget(self.btn_dos_puntos)
         layout_izq.addLayout(layout_botones)
- 
 
-        # Grupo Resultados
         gb_res = QGroupBox()
         self.gb_res = gb_res
         gb_res.setStyleSheet(estilo_gb)
@@ -1630,7 +1617,6 @@ class TorreCoolingApp(QMainWindow):
         layout_izq.addWidget(gb_res)
         layout_izq.addStretch()
 
-        # SECCIÓN DERECHA
         panel_derecho = QWidget()
         layout_der = QVBoxLayout(panel_derecho)
         layout_der.setContentsMargins(5, 5, 5, 5)
@@ -1908,7 +1894,7 @@ class TorreCoolingApp(QMainWindow):
         dlg.exec_()
 
 # ==========================================
-# 10. PUNTO DE ENTRADA
+# PUNTO DE ENTRADA
 # ==========================================
 if __name__ == '__main__':
     app = QApplication(sys.argv)
