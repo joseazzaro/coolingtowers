@@ -29,7 +29,7 @@ class ControladorPID:
         self.u_min = float(u_min)
         self.u_max = float(u_max)
         self.deadband = max(0.0, float(deadband))
-        self.max_rate = float(max_rate)  # % máx de cambio por paso
+        self.max_rate = float(max_rate)
         self.integral = 0.0
         self.prev_error = None
         self.prev_u = None
@@ -55,7 +55,6 @@ class ControladorPID:
         P = self.Kp * error_calc
         D = self.Kp * self.Td * (error_real - self.prev_error) / dt if dt > 0 else 0.0
 
-        # Anti-Windup con Clamping Condicional
         u_tentativo = P + (self.Kp / self.Ti) * self.integral + D
         
         bloquear_integral = False
@@ -71,7 +70,6 @@ class ControladorPID:
         u_unsat = P + I + D
         u_sat = max(self.u_min, min(self.u_max, u_unsat))
 
-        # Limitador de rampa
         if self.prev_u is not None and self.max_rate > 0:
             delta_u = u_sat - self.prev_u
             if abs(delta_u) > self.max_rate:
@@ -132,6 +130,8 @@ class CalibracionWorker(QThread if HAS_PYQT5 else object):
                     return
                 
                 res1['es_dual'] = False
+                res1['c_coef'] = None
+                res1['m_exp'] = None
                 if HAS_PYQT5:
                     self.progreso_signal.emit("Completado", 100)
                     self.exito_signal.emit(res1)
@@ -158,17 +158,17 @@ class CalibracionWorker(QThread if HAS_PYQT5 else object):
                         self.cancelado_signal.emit()
                     return
 
-                lg1 = res1.get('L_G_ratio', 1.0)
-                lg2 = res2.get('L_G_ratio', 1.0)
-                ntu1 = res1.get('NTU', 1.0)
-                ntu2 = res2.get('NTU', 1.0)
+                lg1 = float(res1.get('L_G_ratio', 1.0))
+                lg2 = float(res2.get('L_G_ratio', 1.0))
+                ntu1 = float(res1.get('NTU', 1.0))
+                ntu2 = float(res2.get('NTU', 1.0))
 
                 if abs(lg1 - lg2) < 1e-5:
                     m_exp = 0.6
                 else:
-                    m_exp = -np.log(ntu1 / ntu2) / np.log(lg1 / lg2)
+                    m_exp = float(-np.log(ntu1 / ntu2) / np.log(lg1 / lg2))
 
-                c_coef = ntu1 / (lg1 ** (-m_exp))
+                c_coef = float(ntu1 / (lg1 ** (-m_exp)))
 
                 res1['es_dual'] = True
                 res1['c_coef'] = c_coef
@@ -252,6 +252,11 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
             NTU_ref = self.cfg['ntu_ref']
             T_set = self.cfg['t_setpoint']
 
+            # Configuración de 2 puntos para el NTU modulante
+            es_dual = self.cfg.get('es_dual', False)
+            c_coef = self.cfg.get('c_coef', None)
+            m_exp = self.cfg.get('m_exp', None)
+
             pct_drift = float(self.cfg.get('pct_drift', 0.005))
             coc = float(self.cfg.get('coc', 4.0))
 
@@ -277,18 +282,25 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
 
             pid.reset(u_inicial=self.cfg['speed_min'])
 
+            # Calentamiento numérico previo (warm-up)
             for _ in range(30):
                 u_init = pid.calcular(T_set, T_piscina, dt_sim_sec)
                 m_a_init = max(0.05 * m_a_nom, m_a_nom * (u_init / 100.0))
 
+                if es_dual and c_coef is not None and m_exp is not None:
+                    lg_init = m_w_nom / m_a_init
+                    ntu_step_init = float(c_coef * (lg_init ** (-m_exp)))
+                else:
+                    ntu_step_init = NTU_ref
+
                 if tipo_equipo == 'counterflow':
                     T_sal_init, _, _, _, _, _ = simular_torre_counterflow_1d(
-                        NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
+                        ntu_step_init, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
                         Nz=16, lut=lut
                     )
                 else:
                     T_sal_init, _, _, _, _, _ = simular_torre_2d_matriz(
-                        NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
+                        ntu_step_init, T_w_in_dinamica, m_w_nom, h_a_in0, w_a_in0, m_a_init, patm_0, 
                         Nx=6, Ny=6, lut=lut
                     )
 
@@ -307,6 +319,7 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
 
             drift_m3h = caudal_w_m3h * (pct_drift / 100.0)
 
+            # Bucle temporal anual/climático
             for idx in range(total_pasos):
                 if self._is_cancelled:
                     if HAS_PYQT5:
@@ -328,24 +341,31 @@ class SimularDinamicaWorker(QThread if HAS_PYQT5 else object):
                 velocidad_pct = pid.calcular(T_set, T_piscina, dt_sim_sec)
                 m_a_actual = max(0.05 * m_a_nom, m_a_nom * (velocidad_pct / 100.0))
 
+                # NTU MODULANTE POR MODIFICACIÓN DE AIRE Y L/G
+                if es_dual and c_coef is not None and m_exp is not None:
+                    lg_actual = m_w_nom / m_a_actual
+                    ntu_actual_paso = float(c_coef * (lg_actual ** (-m_exp)))
+                else:
+                    ntu_actual_paso = NTU_ref
+
                 u_ratio = velocidad_pct / 100.0
                 p_elec_instantanea_kw = (p_motor_nom_kw / eta_glob) * (u_ratio ** 3)
                 energia_acum_kwh += p_elec_instantanea_kw * (dt_sim_sec / 3600.0)
 
                 if tipo_equipo == 'counterflow':
                     T_salida_inst, evap_kg_s, _, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_counterflow_1d(
-                        NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
+                        ntu_actual_paso, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
                         Nz=16, lut=lut
                     )
                 else:
                     T_salida_inst, evap_kg_s, _, Matriz_w_a, Matriz_T_a, Matriz_niebla = simular_torre_2d_matriz(
-                        NTU_ref, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
+                        ntu_actual_paso, T_w_in_dinamica, m_w_nom, h_a_in_k, w_a_in_k, m_a_actual, patm_k,
                         Nx=6, Ny=6, lut=lut
                     )
 
                 T_salida_inst = max(twb_k, min(T_w_in_dinamica, T_salida_inst))
                 T_a_out_prom = float(np.mean(Matriz_T_a[:, -1]))
-                w_a_out_prom = float(np.mean(Matriz_w_a[:, -1]))  # En kg/kg para compatibilidad psicrométrica
+                w_a_out_prom = float(np.mean(Matriz_w_a[:, -1]))
                 hay_niebla_paso = bool(np.any(Matriz_niebla))
 
                 T_piscina = T_piscina + fraccion_renovacion * (T_salida_inst - T_piscina)

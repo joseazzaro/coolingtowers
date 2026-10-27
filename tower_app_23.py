@@ -49,10 +49,10 @@ import matplotlib.ticker as mticker
 # ==========================================
 # CONSTANTES LOCALES
 # ==========================================
-cp_w_def = CP_WATER_DEFAULT       # 4.184 kJ/kg.K
-cp_a_def = CP_AIR_DEFAULT         # 1.006 kJ/kg.K
-cp_v_def = CP_VAPOR_DEFAULT       # 1.86 kJ/kg.K
-h_fg0_def = H_FG0_DEFAULT         # 2501.0 kJ/kg
+cp_w_def = CP_WATER_DEFAULT
+cp_a_def = CP_AIR_DEFAULT
+cp_v_def = CP_VAPOR_DEFAULT
+h_fg0_def = H_FG0_DEFAULT
 
 
 # ==========================================
@@ -846,7 +846,6 @@ class VentanaSimulacionDinamica(QDialog):
         if file_path:
             self.txt_epw_path.setText(file_path)
             try:
-                # Comportamiento continuo estilo EnergyPlus (año canónico por defecto: 2021)
                 clima = leer_archivo_epw(file_path, año_referencia=2021)
                 if clima:
                     dt_min = min(c['dt'] for c in clima)
@@ -902,6 +901,9 @@ class VentanaSimulacionDinamica(QDialog):
                 'densidad_a': self.datos_torre['densidad_a'],
                 't_w_in_nom': self.datos_torre['T_w_in'],
                 'ntu_ref': self.datos_torre['NTU'],
+                'es_dual': self.datos_torre.get('es_dual', False),
+                'c_coef': self.datos_torre.get('c_coef', None),
+                'm_exp': self.datos_torre.get('m_exp', None),
                 'año_referencia': 2021
             }
 
@@ -1189,7 +1191,7 @@ class VentanaSimulacionDinamica(QDialog):
 
 
 # ==========================================
-# CANVA DE MATPLOTLIB 2D
+# CANVA DE MATPLOTLIB ADAPTATIVO (2D / 1D)
 # ==========================================
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None, width=6, height=6, dpi=100):
@@ -1221,13 +1223,14 @@ class MplCanvas(FigureCanvas):
             label_cbar = traducir(idioma, 'mapa2d_cbar_ta')
 
         Ny, Nx = Matriz_plot.shape
+        es_counterflow = (datos_res.get('tipo_equipo') == 'counterflow')
 
         im = self.ax.imshow(Matriz_plot, cmap=cmap_use, origin='upper', aspect='auto')
         colorbar = self.fig.colorbar(im, ax=self.ax, pad=0.03)
         colorbar.set_label(label_cbar, fontsize=9, color='#333333', labelpad=8)
         colorbar.ax.tick_params(labelsize=8)
 
-        if datos_res['hay_niebla']:
+        if datos_res.get('hay_niebla', False) and 'Matriz_niebla' in datos_res:
             Matriz_niebla = datos_res['Matriz_niebla']
             capa_niebla = np.zeros((Ny, Nx, 4))
             capa_niebla[Matriz_niebla] = [0.2, 0.2, 0.2, 0.35] 
@@ -1240,17 +1243,30 @@ class MplCanvas(FigureCanvas):
             self.ax.legend(loc='lower left', fontsize=8, framealpha=0.85)
 
         motor_str = "CoolProp Engine" if HAS_COOLPROP else "ASHRAE Standard Engine"
-        N = datos_res['num_celdas']
-        titulo_texto = traducir(
-            idioma, 'mapa2d_titulo',
-            n=N, capa=nombres_capa.get(capa_seleccionada, capa_seleccionada),
-            ntu=datos_res['NTU'], motor=motor_str,
-            tin=datos_res['T_w_in'], tsal=datos_res['T_salida']
-        )
-        self.ax.set_title(titulo_texto, fontsize=10, fontweight='bold', color='#222222', pad=12)
+        N = datos_res.get('num_celdas', Ny)
 
-        self.ax.set_xlabel(traducir(idioma, 'mapa2d_xlabel'), fontsize=9, color='#444444', labelpad=8)
-        self.ax.set_ylabel(traducir(idioma, 'mapa2d_ylabel'), fontsize=9, color='#444444', labelpad=8)
+        if es_counterflow:
+            titulo_texto = traducir(
+                idioma, 'mapa_titulo_counterflow',
+                n=N, capa=nombres_capa.get(capa_seleccionada, capa_seleccionada),
+                ntu=datos_res['NTU'], motor=motor_str,
+                tin=datos_res['T_w_in'], tsal=datos_res['T_salida']
+            )
+            lbl_x = traducir(idioma, 'mapa_xlabel_counterflow')
+            lbl_y = traducir(idioma, 'mapa_ylabel_counterflow')
+        else:
+            titulo_texto = traducir(
+                idioma, 'mapa_titulo_crossflow',
+                n=N, capa=nombres_capa.get(capa_seleccionada, capa_seleccionada),
+                ntu=datos_res['NTU'], motor=motor_str,
+                tin=datos_res['T_w_in'], tsal=datos_res['T_salida']
+            )
+            lbl_x = traducir(idioma, 'mapa_xlabel_crossflow')
+            lbl_y = traducir(idioma, 'mapa_ylabel_crossflow')
+
+        self.ax.set_title(titulo_texto, fontsize=9.5, fontweight='bold', color='#222222', pad=10)
+        self.ax.set_xlabel(lbl_x, fontsize=8.5, color='#444444', labelpad=7)
+        self.ax.set_ylabel(lbl_y, fontsize=8.5, color='#444444', labelpad=7)
         self.ax.tick_params(labelsize=8)
 
         self.fig.tight_layout()
@@ -1287,8 +1303,9 @@ class TorreCoolingApp(QMainWindow):
 
     def seleccionar_equipo(self, tipo):
         self.tipo_equipo_actual = tipo
-        nombre = "Flujo Cruzado (Crossflow)" if tipo == 'crossflow' else "Contraflujo (Counterflow)"
-        self.status_bar.showMessage(f"Tipo de Equipo seleccionado: {nombre}")
+        nombre = self.tr_txt('equipo_crossflow') if tipo == 'crossflow' else self.tr_txt('equipo_counterflow')
+        self.status_bar.showMessage(f"Tipo de Equipo: {nombre}")
+        self.retranslate_ui()
 
     def init_menu(self):
         menubar = self.menuBar()
@@ -1296,12 +1313,12 @@ class TorreCoolingApp(QMainWindow):
         # Menú Equipo
         self.menu_equipo = menubar.addMenu("Equipo")
         
-        self.action_crossflow = QAction("Torre Flujo Cruzado (Crossflow)", self)
+        self.action_crossflow = QAction(self)
         self.action_crossflow.setCheckable(True)
         self.action_crossflow.setChecked(True)
         self.action_crossflow.triggered.connect(lambda: self.seleccionar_equipo('crossflow'))
 
-        self.action_counterflow = QAction("Torre Contraflujo (Counterflow)", self)
+        self.action_counterflow = QAction(self)
         self.action_counterflow.setCheckable(True)
         self.action_counterflow.triggered.connect(lambda: self.seleccionar_equipo('counterflow'))
 
@@ -1357,19 +1374,6 @@ class TorreCoolingApp(QMainWindow):
         self.action_reset_prefs = QAction(self)
         self.action_reset_prefs.triggered.connect(self._reset_all_preferences)
         self.menu_settings.addAction(self.action_reset_prefs)
-
-        # Asignación de textos según idioma
-        self.action_idioma_es.setText(self.tr_txt('idioma_es'))
-        self.action_idioma_en.setText(self.tr_txt('idioma_en'))
-        self.action_sim_dinamica.setText(self.tr_txt('accion_sim_dinamica'))
-        self.action_sim_dinamica.setToolTip(self.tr_txt('tip_sim_dinamica'))
-        self.action_ver_pluma.setText(self.tr_txt('accion_ver_pluma'))
-        self.action_ver_pluma.setToolTip(self.tr_txt('tip_ver_pluma'))
-        self.action_psicrometrico.setText(self.tr_txt('accion_ver_psicrometrico'))
-        self.action_psicrometrico.setToolTip(self.tr_txt('tip_ver_psicrometrico'))
-        self.action_duracion.setText(self.tr_txt('accion_ver_duracion'))
-        self.action_duracion.setToolTip(self.tr_txt('tip_ver_duracion'))
-        self.action_reset_prefs.setText(self.tr_txt('sim_reset_prefs'))
 
     def _reset_all_preferences(self):
         reply = QMessageBox.question(
@@ -1555,15 +1559,26 @@ class TorreCoolingApp(QMainWindow):
     def retranslate_ui(self):
         self.setWindowTitle(self.tr_txt('title'))
 
+        self.menu_equipo.setTitle(self.tr_txt('menu_equipo'))
+        self.action_crossflow.setText(self.tr_txt('equipo_crossflow'))
+        self.action_counterflow.setText(self.tr_txt('equipo_counterflow'))
+
         self.menu_simulacion.setTitle(self.tr_txt('menu_simulacion'))
         self.action_sim_dinamica.setText(self.tr_txt('accion_sim_dinamica'))
         self.action_sim_dinamica.setStatusTip(self.tr_txt('tip_sim_dinamica'))
         self.action_ver_pluma.setText(self.tr_txt('accion_ver_pluma'))
         self.action_ver_pluma.setStatusTip(self.tr_txt('tip_ver_pluma'))
+        self.action_psicrometrico.setText(self.tr_txt('accion_ver_psicrometrico'))
+        self.action_psicrometrico.setStatusTip(self.tr_txt('tip_ver_psicrometrico'))
+        self.action_duracion.setText(self.tr_txt('accion_ver_duracion'))
+        self.action_duracion.setStatusTip(self.tr_txt('tip_ver_duracion'))
 
         self.menu_idioma.setTitle(self.tr_txt('menu_idioma'))
         self.action_idioma_es.setText(self.tr_txt('idioma_es'))
         self.action_idioma_en.setText(self.tr_txt('idioma_en'))
+
+        self.menu_settings.setTitle(self.tr_txt('menu_settings'))
+        self.action_reset_prefs.setText(self.tr_txt('sim_reset_prefs'))
 
         self.gb_agua.setTitle(self.tr_txt('gb_agua'))
         self.gb_aire.setTitle(self.tr_txt('gb_aire'))
@@ -1575,7 +1590,7 @@ class TorreCoolingApp(QMainWindow):
         self.btn_calcular.setText(self.tr_txt('btn_calcular'))
         self.btn_dos_puntos.setText(self.tr_txt('btn_dos_puntos'))
 
-        # Actualización de etiqueta del combo según el tipo de equipo
+        # Actualización de etiqueta del combobox según el equipo seleccionado
         if getattr(self, 'tipo_equipo_actual', 'crossflow') == 'counterflow':
             self.lbl_combo.setText(self.tr_txt('lbl_combo_counterflow'))
         else:
@@ -1607,7 +1622,7 @@ class TorreCoolingApp(QMainWindow):
     def actualizar_labels_resultado(self, res):
         self.lbl_ntu_res.setText(f"{self.tr_txt('res_ntu_label')} <b style='font-size:10.5pt; color:#2980B9;'>{res['NTU']:.4f}</b>")
 
-        if res['es_dual']:
+        if res.get('es_dual', False) and res.get('c_coef') is not None:
             c = res['c_coef']
             m = res['m_exp']
             self.lbl_merkel_res.setText(f"{self.tr_txt('res_merkel_label')} <b style='color:#8E44AD;'>c = {c:.3f}, m = {m:.3f}</b>")
@@ -1693,7 +1708,7 @@ class TorreCoolingApp(QMainWindow):
 
         self.actualizar_labels_resultado(res)
 
-        if res['es_dual']:
+        if res.get('es_dual', False) and res.get('c_coef') is not None:
             c = res['c_coef']
             m = res['m_exp']
             self.status_bar.showMessage(self.tr_txt('msg_2p_exito', c=c, m=m))
@@ -1729,6 +1744,9 @@ class TorreCoolingApp(QMainWindow):
 
         d_torre = self.obtener_datos_pantalla_p1()
         d_torre['NTU'] = self.ultimo_resultado['NTU']
+        d_torre['es_dual'] = self.ultimo_resultado.get('es_dual', False)
+        d_torre['c_coef'] = self.ultimo_resultado.get('c_coef', None)
+        d_torre['m_exp'] = self.ultimo_resultado.get('m_exp', None)
 
         dlg = VentanaSimulacionDinamica(self, datos_torre=d_torre, idioma=self.idioma, estado_previo=self.ultimo_estado_sim)
         dlg.exec_()
@@ -1761,90 +1779,6 @@ class TorreCoolingApp(QMainWindow):
             return
         dlg = DialogoDuracionAcumulada(self, datos_sim=self.ultimo_resultado_dinamico, idioma=self.idioma)
         dlg.exec_()
-
-
-# ==========================================
-# CANVA DE MATPLOTLIB ADAPTATIVO (2D / 1D)
-# ==========================================
-class MplCanvas(FigureCanvas):
-    def __init__(self, parent=None, width=6, height=6, dpi=100):
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.ax = self.fig.add_subplot(111)
-        super().__init__(self.fig)
-
-    def graficar_matriz(self, datos_res, capa_seleccionada='Tw', idioma='es'):
-        self.fig.clear()
-        self.ax = self.fig.add_subplot(111)
-
-        nombres_capa = {
-            'Tw': traducir(idioma, 'combo_tw'),
-            'wa': traducir(idioma, 'combo_wa'),
-            'Ta': traducir(idioma, 'combo_ta'),
-        }
-
-        if capa_seleccionada == 'Tw':
-            Matriz_plot = datos_res['Matriz_T_w']
-            cmap_use = 'coolwarm'
-            label_cbar = traducir(idioma, 'mapa2d_cbar_tw')
-        elif capa_seleccionada == 'wa':
-            Matriz_plot = datos_res['Matriz_w_a']
-            cmap_use = 'Blues'
-            label_cbar = traducir(idioma, 'mapa2d_cbar_wa')
-        else:
-            Matriz_plot = datos_res['Matriz_T_a']
-            cmap_use = 'YlOrRd'
-            label_cbar = traducir(idioma, 'mapa2d_cbar_ta')
-
-        Ny, Nx = Matriz_plot.shape
-        es_counterflow = (datos_res.get('tipo_equipo') == 'counterflow')
-
-        im = self.ax.imshow(Matriz_plot, cmap=cmap_use, origin='upper', aspect='auto')
-        colorbar = self.fig.colorbar(im, ax=self.ax, pad=0.03)
-        colorbar.set_label(label_cbar, fontsize=9, color='#333333', labelpad=8)
-        colorbar.ax.tick_params(labelsize=8)
-
-        if datos_res.get('hay_niebla', False) and 'Matriz_niebla' in datos_res:
-            Matriz_niebla = datos_res['Matriz_niebla']
-            capa_niebla = np.zeros((Ny, Nx, 4))
-            capa_niebla[Matriz_niebla] = [0.2, 0.2, 0.2, 0.35] 
-            
-            self.ax.imshow(capa_niebla, origin='upper', aspect='auto')
-            self.ax.contour(Matriz_niebla, levels=[0.5], colors=['#222222'], linestyles=['--'], linewidths=[1.5])
-            
-            self.ax.plot([], [], color='#666666', alpha=0.5, linewidth=6, label=traducir(idioma, 'mapa2d_zona_niebla'))
-            self.ax.plot([], [], color='#222222', linestyle='--', linewidth=1.5, label=traducir(idioma, 'mapa2d_frente_condensacion'))
-            self.ax.legend(loc='lower left', fontsize=8, framealpha=0.85)
-
-        motor_str = "CoolProp Engine" if HAS_COOLPROP else "ASHRAE Standard Engine"
-        N = datos_res.get('num_celdas', Ny)
-
-        # Selección contextual de título y etiquetas de ejes
-        if es_counterflow:
-            titulo_texto = traducir(
-                idioma, 'mapa_titulo_counterflow',
-                n=N, capa=nombres_capa.get(capa_seleccionada, capa_seleccionada),
-                ntu=datos_res['NTU'], motor=motor_str,
-                tin=datos_res['T_w_in'], tsal=datos_res['T_salida']
-            )
-            lbl_x = traducir(idioma, 'mapa_xlabel_counterflow')
-            lbl_y = traducir(idioma, 'mapa_ylabel_counterflow')
-        else:
-            titulo_texto = traducir(
-                idioma, 'mapa_titulo_crossflow',
-                n=N, capa=nombres_capa.get(capa_seleccionada, capa_seleccionada),
-                ntu=datos_res['NTU'], motor=motor_str,
-                tin=datos_res['T_w_in'], tsal=datos_res['T_salida']
-            )
-            lbl_x = traducir(idioma, 'mapa_xlabel_crossflow')
-            lbl_y = traducir(idioma, 'mapa_ylabel_crossflow')
-
-        self.ax.set_title(titulo_texto, fontsize=9.5, fontweight='bold', color='#222222', pad=10)
-        self.ax.set_xlabel(lbl_x, fontsize=8.5, color='#444444', labelpad=7)
-        self.ax.set_ylabel(lbl_y, fontsize=8.5, color='#444444', labelpad=7)
-        self.ax.tick_params(labelsize=8)
-
-        self.fig.tight_layout()
-        self.draw()
 
 
 # ==========================================
